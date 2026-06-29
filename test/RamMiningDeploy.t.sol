@@ -91,11 +91,11 @@ contract RamMiningDeployTest is Test {
 
         // a keeper sells NVDA into the vault at the oracle price + premium
         uint256 amount = 2e18;
-        uint256 quoted = vault.quoteSellToVault(amount);
+        uint256 quoted = vault.quoteRWAToVault(amount);
         reward.mint(keeper, amount);
         vm.startPrank(keeper);
         reward.approve(address(vault), amount);
-        uint256 owed = vault.sellRewardToVault(amount, 0);
+        uint256 owed = vault.sellRWAToVault(amount, 0);
         vm.stopPrank();
         assertEq(owed, quoted);
         assertEq(keeper.balance, quoted);

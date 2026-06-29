@@ -12,15 +12,17 @@ import {RamMiningBeaconFactory, RamMiningVaultUpgradeable, AggregatorV3Interface
 /// Runs ONLY when BNB_RPC_URL is set (otherwise it returns early so the suite stays green). The reward token and
 /// feeds default to the verified mainnet addresses but can be overridden by env vars:
 ///   - BNB_RPC_URL       : a BNB mainnet RPC (REQUIRED; never hardcoded).
-///   - FORK_BLOCK        : optional block number to pin (use a recent WEEKDAY block so NVDA/USD is fresh).
+///   - FORK_BLOCK        : optional block number to pin (a weekend block is great — it proves continuous operation).
 ///   - NVDAX_ADDRESS     : the reward token (defaults to NVDAB 0x02Fca66C…7436).
 ///   - NVDA_USD_FEED     : Chainlink NVDA/USD (defaults to 0xea5c2Cbb…99B8, 8 dec).
 ///   - BNB_USD_FEED      : Chainlink BNB/USD  (defaults to 0x0567F232…42aeE, 8 dec).
+///   - REWARD_STALE      : NVDA/USD staleness bound (defaults to 7d, Flap #8; may be set up to 30d).
 ///
-/// IMPORTANT (weekend-freeze honesty): staleness is NOT relaxed. The reward-feed staleness bound stays at a real
-/// 2h. If the forked block lands when NVDA/USD is frozen (nights/weekends), the test asserts the keeper path
-/// REVERTS on staleness (the de-facto acquisition pause). If the feed is fresh (market open), it runs the full
-/// keeper fill + distribute + claim against the real asset.
+/// WEEKEND CONTINUOUS OPERATION (Flap #8): the NVDA/USD staleness bound is GENEROUS (7d default). Per Flap's
+/// guidance the vault must NOT pause buys/fills off-hours — a stock feed frozen over a weekend is still within the
+/// 7d bound, so the keeper fill OPERATES at the last (Friday) print. This INVERTS the old "weekend-freeze =
+/// de-facto pause" behaviour. A genuinely dead feed (older than the bound) still reverts (the dead-feed safety
+/// wall, covered as a unit test). This fork test proves the real fill + distribute + claim path against NVDAB.
 contract RamMiningVaultForkTest is Test {
     address constant GUARDIAN_MAINNET = 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b;
     address constant BNB_MAINNET_VAULT_PORTAL = 0x90497450f2a706f1951b5bdda52B4E5d16f34C06;
@@ -34,10 +36,10 @@ contract RamMiningVaultForkTest is Test {
     address constant MINER = address(0xA11CE);
     address constant KEEPER = address(0xBEEF);
 
-    // real bound (2h) that still catches the weekend freeze; overridable via env to exercise the fresh-market path
-    // on a weekend (when the live feed is hours-stale) without weakening the production default.
+    // Generous NVDA/USD staleness (Flap #8): weekend-frozen feeds keep operating; only a genuinely dead feed
+    // (older than this bound, ≤ MAX_REWARD_FEED_STALE = 30d) reverts. Overridable via env.
     function _rewardStale() internal view returns (uint256) {
-        return vm.envOr("REWARD_STALE", uint256(2 hours));
+        return vm.envOr("REWARD_STALE", uint256(7 days));
     }
 
     /// @dev Deploy + set realistic oracle guards. Split out to keep the test function's stack shallow.
@@ -48,11 +50,11 @@ contract RamMiningVaultForkTest is Test {
             vm.envOr("NVDA_USD_FEED", NVDA_USD),
             vm.envOr("BNB_USD_FEED", BNB_USD),
             uint256(0.001 ether),
-            block.timestamp + 30 days
+            block.timestamp + 120 days
         );
         vm.prank(BNB_MAINNET_VAULT_PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vaultData)));
-        // realistic real bounds — NOT relaxed to mask the weekend freeze.
+        // BNB/USD tight (24/7), NVDA/USD generous (weekend continuous operation per Flap #8).
         vm.prank(GUARDIAN_MAINNET);
         vault.setOracleGuards(500, 2 hours, _rewardStale());
     }
@@ -85,26 +87,29 @@ contract RamMiningVaultForkTest is Test {
 
         RamMiningVaultUpgradeable vault = _deployForkVault(nvda);
 
-        // a miner buys power. Read basePriceWei() BEFORE the prank — an external call inside {value:...} would
-        // otherwise consume vm.prank (Foundry gotcha) and the rig would go to the test contract, not MINER.
+        // a miner buys a long-lived (Hyper) rig. Read basePriceWei() BEFORE the prank — an external call inside
+        // {value:...} would otherwise consume vm.prank (Foundry gotcha) and the rig would go to the test contract.
         vm.deal(MINER, 1 ether);
-        uint256 rigPrice = vault.basePriceWei();
+        (uint256 hyperPrice,,,) = vault.getPlan(3);
         vm.prank(MINER);
-        vault.buyMiningContract{value: rigPrice}(0);
+        vault.buyMiningContract{value: hyperPrice}(3);
         // simulate BNB fees arriving in the vault treasury
         vm.deal(address(vault), 5 ether);
 
         if (_feedFresh(vault.rewardPriceFeed(), _rewardStale())) {
-            _runFreshMarketPath(vault, nvda);
+            // Normal case with the generous bound: weekday OR weekend, the fill OPERATES (Flap #8).
+            _runContinuousFillPath(vault, nvda);
         } else {
-            emit log("NVDA/USD feed stale at this block (market closed) -> keeper path must revert (de-facto pause)");
-            _runFrozenFeedPath(vault);
+            // Only reached if the pinned block has an NVDA/USD feed older than the staleness bound (genuinely
+            // dead / very long holiday): the dead-feed safety wall must make the quote/sell revert.
+            emit log("NVDA/USD feed older than the staleness bound (dead feed) -> keeper path must revert");
+            _runDeadFeedPath(vault);
         }
     }
 
-    /// Market OPEN: full keeper fill + distribute + claim against the real NVDAB, then an acquisition-pause check.
-    function _runFreshMarketPath(RamMiningVaultUpgradeable vault, address nvda) internal {
-        // arm the deviation band reference at the live price (required before caps), then the egress caps
+    /// Continuous operation: full keeper fill + distribute + claim against the real NVDAB (weekday or weekend).
+    function _runContinuousFillPath(RamMiningVaultUpgradeable vault, address nvda) internal {
+        // arm the deviation band reference at the live price (required before caps), then the egress caps.
         // compute the live reference BEFORE the prank — vault.rewardPriceFeed() is an external call that would
         // otherwise consume vm.prank and make setReferencePrice run as a non-guardian ("Only Guardian").
         uint256 liveRef = _liveNvdaUsd(vault.rewardPriceFeed());
@@ -118,13 +123,13 @@ contract RamMiningVaultForkTest is Test {
         address whale = 0x8894E0a0c962CB723c1976a4421c95949bE2D4E3; // Binance 51, ~85% of NVDAB supply
         vm.prank(whale);
         IERC20(nvda).transfer(KEEPER, 1e18);
-        uint256 quoted = vault.quoteSellToVault(1e18);
+        uint256 quoted = vault.quoteRWAToVault(1e18);
         assertGt(quoted, 0, "oracle quote should be positive");
 
         uint256 keeperBnbBefore = KEEPER.balance; // mainnet fork inherits any real pre-existing balance
         vm.startPrank(KEEPER);
         IERC20(nvda).approve(address(vault), 1e18);
-        assertEq(vault.sellRewardToVault(1e18, 0), quoted, "paid == quote");
+        assertEq(vault.sellRWAToVault(1e18, 0), quoted, "paid == quote");
         vm.stopPrank();
         assertEq(KEEPER.balance - keeperBnbBefore, quoted, "keeper received BNB");
         assertGt(IERC20(nvda).balanceOf(address(vault)), 0, "vault holds real NVDAB");
@@ -137,21 +142,21 @@ contract RamMiningVaultForkTest is Test {
         assertEq(IERC20(nvda).balanceOf(MINER) - minerNvdaBefore, got);
         assertGt(got, 0);
 
-        // simulate acquisition pause: sells revert, but claims still work
-        vm.prank(GUARDIAN_MAINNET);
-        vault.pauseAcquisition();
+        // dead-feed safety wall ON THE REAL FEED: warp past the staleness bound; the long-lived rig keeps the
+        // miner active, so the NEXT sell must revert on staleness (not on "no miners") — the real wall fires.
+        vm.warp(block.timestamp + _rewardStale() + 1 days);
         vm.prank(whale);
         IERC20(nvda).transfer(KEEPER, 1e18);
         vm.startPrank(KEEPER);
         IERC20(nvda).approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Acquisition paused / 收购已暂停"));
-        vault.sellRewardToVault(1e18, 0);
+        vm.expectRevert(bytes(unicode"Stale feed / 预言机数据过期"));
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
-    /// Market CLOSED (feed frozen): the hard staleness check is the de-facto pause — the quote/sell must revert.
-    function _runFrozenFeedPath(RamMiningVaultUpgradeable vault) internal {
+    /// Dead feed (older than the staleness bound): the hard staleness check makes the quote/sell revert.
+    function _runDeadFeedPath(RamMiningVaultUpgradeable vault) internal {
         vm.expectRevert(bytes(unicode"Stale feed / 预言机数据过期"));
-        vault.quoteSellToVault(1e18);
+        vault.quoteRWAToVault(1e18);
     }
 }

@@ -124,7 +124,7 @@ contract RamMiningVaultAgentTest is Test {
         vm.prank(GUARDIAN);
         uint256 id = vault.requestReasoning();
         vm.expectRevert(bytes(unicode"Invalid lever / 无效杠杆"));
-        ai.fulfill(address(vault), id, 5); // LEVER_COUNT == 5 -> 5 is out of range
+        ai.fulfill(address(vault), id, 4); // LEVER_COUNT == 4 -> 4 (old PAUSE lever) is now out of range
     }
 
     // ── levers ───────────────────────────────────────────────────────────
@@ -158,78 +158,26 @@ contract RamMiningVaultAgentTest is Test {
     }
 
     function testLeverRaiseAndLowerPremiumClamped() public {
-        // raise to MAX
+        // raise to MAX (1.04)
         for (uint256 i = 0; i < 20; i++) {
             _fulfill(1);
         }
         assertEq(vault.keeperPremiumBps(), vault.MAX_PREMIUM_BPS());
-        // lower to MIN (never below 100%)
+        // lower to MIN (1.02 — never below Flap's recommended floor)
         for (uint256 i = 0; i < 40; i++) {
             _fulfill(2);
         }
         assertEq(vault.keeperPremiumBps(), vault.MIN_PREMIUM_BPS());
     }
 
-    // ── tiered autonomy: high-impact lever 4 is queued behind a timelock ──
-
-    function testLeverPauseIsQueuedNotImmediate() public {
-        _fulfill(4);
-        assertTrue(vault.hasQueuedAction());
-        assertEq(vault.queuedLever(), 4);
-        // acquisition NOT paused yet (only queued); rig sales unaffected
-        assertFalse(vault.acquisitionPaused());
-        (uint256 price,,,) = vault.getPlan(0);
-        vm.deal(alice, 1 ether);
-        vm.prank(alice);
-        vault.buyMiningContract{value: price}(0); // still works
-    }
-
-    function testQueuedActionTimelockThenExecute() public {
-        _fulfill(4);
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Timelock not elapsed / 时间锁未到"));
-        vault.executeQueuedAction();
-
-        vm.warp(block.timestamp + vault.ACTION_TIMELOCK());
-        vm.prank(GUARDIAN);
-        vault.executeQueuedAction();
-
-        // now acquisition is paused (claims unaffected, rig sales unaffected)
-        assertTrue(vault.acquisitionPaused());
-    }
-
-    function testCancelQueuedAction() public {
-        _fulfill(4);
-        vm.prank(GUARDIAN);
-        vault.cancelQueuedAction();
-        assertFalse(vault.hasQueuedAction());
-    }
-
-    function testExecuteQueuedOnlyGuardian() public {
-        _fulfill(4);
-        vm.warp(block.timestamp + vault.ACTION_TIMELOCK());
-        vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
-        vault.executeQueuedAction();
-    }
-
-    // claims keep working even when acquisition is paused (never trap funds)
-    function testClaimWorksWhileAcquisitionPaused() public {
-        // fund alice's pending via donate
-        reward.mint(address(this), 100 ether);
-        reward.approve(address(vault), type(uint256).max);
-        vault.donateReward(50 ether);
-
-        _fulfill(4);
-        vm.warp(block.timestamp + vault.ACTION_TIMELOCK());
-        vm.prank(GUARDIAN);
-        vault.executeQueuedAction(); // pauses acquisition
-        assertTrue(vault.acquisitionPaused());
-
-        uint256 pending = vault.pendingRewards(alice);
-        assertGt(pending, 0);
-        vm.prank(alice);
-        uint256 got = vault.claimRewards();
-        assertApproxEqAbs(got, pending, 1e6);
+    // No-pause model: lever 4 (the old PAUSE_ACQUISITION) no longer exists; LEVER_COUNT == 4 so any choice ≥ 4
+    // reverts as an invalid lever (covered by testInvalidLeverReverts). All remaining levers only move the
+    // clamped premium and execute immediately — there is no queued/timelocked action machinery anymore.
+    function testNoQueuedActionMachinery() public {
+        // the queued-action selectors were removed with the pause lever
+        (bool a,) = address(vault).call(abi.encodeWithSignature("executeQueuedAction()"));
+        (bool b,) = address(vault).call(abi.encodeWithSignature("cancelQueuedAction()"));
+        assertTrue(!a && !b, "no queued-action selector may exist");
     }
 
     // ── trigger / epoch loop ─────────────────────────────────────────────

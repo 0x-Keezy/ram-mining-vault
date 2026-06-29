@@ -100,19 +100,6 @@ contract RevertingBuyer {
     }
 }
 
-/// @dev Configurable on-chain pause oracle for the reward token (blocker #3 rescue gate).
-contract MockPauseManager {
-    bool public paused;
-
-    function setPaused(bool v) external {
-        paused = v;
-    }
-
-    function isTokenPaused(address) external view returns (bool) {
-        return paused;
-    }
-}
-
 /// @dev Fee-on-transfer reward token (1% fee burned on every non-mint transfer) — must-fix #5/#8: the vault must
 ///      credit + pay the keeper on the REAL received delta, not the nominal amount.
 contract FeeRewardToken is ERC20 {
@@ -133,7 +120,7 @@ contract FeeRewardToken is ERC20 {
     }
 }
 
-/// @dev Malicious keeper that tries to re-enter sellRewardToVault from its BNB receive() hook.
+/// @dev Malicious keeper that tries to re-enter sellRWAToVault from its BNB receive() hook.
 contract ReentrantKeeper {
     RamMiningVaultUpgradeable public vault;
     IERC20 public reward;
@@ -149,14 +136,14 @@ contract ReentrantKeeper {
     function attack(uint256 _amt) external {
         amt = _amt;
         reward.approve(address(vault), type(uint256).max);
-        vault.sellRewardToVault(_amt, 0);
+        vault.sellRWAToVault(_amt, 0);
     }
 
     receive() external payable {
         // attempt to re-enter while the vault is paying us; the nonReentrant guard must block it
         if (!reentryAttempted) {
             reentryAttempted = true;
-            try vault.sellRewardToVault(amt, 0) {
+            try vault.sellRWAToVault(amt, 0) {
                 reentryReverted = false;
             } catch {
                 reentryReverted = true;
@@ -256,7 +243,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, amount);
         vm.startPrank(keeper);
         reward.approve(address(vault), amount);
-        bnbOwed = vault.sellRewardToVault(amount, minBnbOut);
+        bnbOwed = vault.sellRWAToVault(amount, minBnbOut);
         vm.stopPrank();
     }
 
@@ -284,8 +271,8 @@ contract RamMiningVaultTest is Test {
         assertEq(ui.methods[4].inputs[1].fieldType, "msg.value");
         assertEq(ui.methods[5].name, "claimRewards");
         assertTrue(ui.methods[5].isWriteMethod);
-        assertEq(ui.methods[6].name, "quoteSellToVault");
-        assertEq(ui.methods[7].name, "sellRewardToVault");
+        assertEq(ui.methods[6].name, "quoteRWAToVault");
+        assertEq(ui.methods[7].name, "sellRWAToVault");
         assertTrue(ui.methods[7].isWriteMethod);
         assertEq(ui.methods[7].approvals[0].tokenType, "rewardToken");
         assertEq(ui.methods[8].name, "claimRewardsTo");
@@ -299,7 +286,10 @@ contract RamMiningVaultTest is Test {
         assertEq(vault.basePriceWei(), basePrice);
         assertEq(vault.seasonEnd(), seasonEnd);
         assertEq(vault.rewardTokenDecimals(), 18);
-        assertEq(vault.keeperPremiumBps(), 10200);
+        assertEq(vault.keeperPremiumBps(), 10300); // default 1.03 (centre of Flap's 1.02–1.04 band)
+        // weekend-friendly staleness defaults (Flap #8): NVDA/USD generous (7d), BNB/USD tight (2h)
+        assertEq(vault.rewardFeedMaxStale(), 7 days);
+        assertEq(vault.bnbFeedMaxStale(), 2 hours);
         // sells disabled until the guardian arms the egress caps
         assertEq(vault.maxBnbOutPerFill(), 0);
         assertEq(vault.maxBnbOutPerWindow(), 0);
@@ -366,11 +356,11 @@ contract RamMiningVaultTest is Test {
 
     // ── keeper / RFQ acquisition ───────────────────────────────────────
 
-    function testQuoteSellToVault() public view {
-        // 1 NVDA @ $130 / $600 BNB = 0.21666.. BNB market, +2% premium = 0.221 BNB
-        uint256 owed = vault.quoteSellToVault(1e18);
+    function testQuoteRWAToVault() public view {
+        // 1 NVDA @ $130 / $600 BNB = 0.21666.. BNB market, +3% default premium
+        uint256 owed = vault.quoteRWAToVault(1e18);
         uint256 expectedMarket = (1e18 * uint256(NVDA_USD)) / uint256(BNB_USD);
-        uint256 expected = (expectedMarket * 10200) / 10000;
+        uint256 expected = (expectedMarket * 10300) / 10000;
         assertEq(owed, expected);
     }
 
@@ -384,8 +374,8 @@ contract RamMiningVaultTest is Test {
             RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vaultData)));
         assertEq(v8.rewardTokenDecimals(), 8);
 
-        uint256 owed8 = v8.quoteSellToVault(1e8); // 1 token in 8 dec
-        uint256 owed18 = vault.quoteSellToVault(1e18); // 1 token in 18 dec
+        uint256 owed8 = v8.quoteRWAToVault(1e8); // 1 token in 8 dec
+        uint256 owed18 = vault.quoteRWAToVault(1e18); // 1 token in 18 dec
         assertEq(owed8, owed18);
     }
 
@@ -396,7 +386,7 @@ contract RamMiningVaultTest is Test {
         vm.deal(address(vault), 10 ether);
 
         uint256 amount = 1e18;
-        uint256 quoted = vault.quoteSellToVault(amount);
+        uint256 quoted = vault.quoteRWAToVault(amount);
         uint256 keeperBalBefore = keeper.balance;
 
         uint256 owed = _sell(amount, 0);
@@ -417,7 +407,7 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"No miners / 没有矿工"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
@@ -427,12 +417,12 @@ contract RamMiningVaultTest is Test {
         _freshFeeds();
         vm.deal(address(vault), 10 ether);
 
-        uint256 quoted = vault.quoteSellToVault(1e18);
+        uint256 quoted = vault.quoteRWAToVault(1e18);
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Slippage / 滑点过大"));
-        vault.sellRewardToVault(1e18, quoted + 1); // demand more than the quote
+        vault.sellRWAToVault(1e18, quoted + 1); // demand more than the quote
         vm.stopPrank();
     }
 
@@ -441,7 +431,7 @@ contract RamMiningVaultTest is Test {
         _armReference();
         vm.deal(address(vault), 10 ether);
 
-        uint256 quoted = vault.quoteSellToVault(1e18);
+        uint256 quoted = vault.quoteRWAToVault(1e18);
         vm.prank(GUARDIAN);
         vault.setKeeperLimits(quoted - 1, 100 ether); // per-fill cap below the quote
 
@@ -449,7 +439,7 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Over per-fill cap / 超过单次上限"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
@@ -458,7 +448,7 @@ contract RamMiningVaultTest is Test {
         _armReference();
         vm.deal(address(vault), 10 ether);
 
-        uint256 quoted = vault.quoteSellToVault(1e18);
+        uint256 quoted = vault.quoteRWAToVault(1e18);
         vm.prank(GUARDIAN);
         vault.setKeeperLimits(quoted * 2, quoted); // window allows exactly ONE fill of 1e18
 
@@ -469,7 +459,7 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Over window cap / 超过窗口上限"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
 
         // after the window rolls over, a fill is allowed again
@@ -494,7 +484,7 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Price out of band / 价格超出区间"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
@@ -512,19 +502,38 @@ contract RamMiningVaultTest is Test {
         assertGt(owed, 0);
     }
 
-    function testSellStaleRewardFeedReverts() public {
+    /// Flap #8 (weekend continuous operation): with the generous 7d NVDA/USD staleness, a feed that is merely
+    /// frozen over the weekend (e.g. 2 days old) does NOT revert — the keeper fill keeps operating at the last
+    /// print. This INVERTS the old "weekend-freeze = de-facto pause" behaviour, per Flap's onboarding guidance.
+    function testWeekendStaleFeedStillOperates() public {
         _buy(alice, 0);
         _armKeeper();
         _freshFeeds();
         vm.deal(address(vault), 10 ether);
 
-        // NVDA/USD older than rewardFeedMaxStale (default 1 day) -> revert (weekend-freeze guard)
+        // NVDA/USD 2 days old (frozen over a weekend) but within the 7d bound; BNB/USD kept fresh (24/7).
+        // The reference must sit on the same (frozen) feed value so the deviation band passes.
         nvdaFeed.setUpdatedAt(block.timestamp - 2 days);
+        uint256 owed = _sell(1e18, 0); // fill OPERATES (no pause) — Flap #8
+        assertGt(owed, 0);
+        assertGt(vault.pendingRewards(alice), 0);
+    }
+
+    /// Dead-feed safety wall: a genuinely dead NVDA/USD feed (older than the 7d bound) still makes the sell
+    /// REVERT — the generous weekend staleness never tolerates a feed that has actually stopped printing.
+    function testDeadRewardFeedReverts() public {
+        _buy(alice, 0);
+        _armKeeper();
+        _freshFeeds();
+        vm.deal(address(vault), 10 ether);
+
+        // NVDA/USD older than rewardFeedMaxStale (default 7d) -> revert (real dead-feed wall)
+        nvdaFeed.setUpdatedAt(block.timestamp - 8 days);
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Stale feed / 预言机数据过期"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
@@ -540,7 +549,7 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Stale feed / 预言机数据过期"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
@@ -555,7 +564,7 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Bad feed price / 预言机价格无效"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
@@ -571,43 +580,45 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Stale round / 预言机轮次过期"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
-    function testAcquisitionPausedBlocksSellButNotClaim() public {
+    /// Flap no-pause model: there is NO pause anywhere. The Guardian has NO selector to pause acquisition, pause
+    /// the vault, or drain via an emergency hatch — recovery is the Guardian-only beacon upgrade (factory). This
+    /// asserts every removed privileged hatch/pause selector is genuinely absent (low-level call returns false).
+    function testNoPauseOrEmergencyHatchSelectorsExist() public {
+        // pause / acquisition-pause selectors are gone
+        (bool a,) = address(vault).call(abi.encodeWithSignature("pauseVault()"));
+        (bool b,) = address(vault).call(abi.encodeWithSignature("pauseAcquisition()"));
+        (bool c,) = address(vault).call(abi.encodeWithSignature("resumeAcquisition()"));
+        // emergency-withdraw / rescue hatches are gone (Rule 009 proxy exemption)
+        (bool d,) = address(vault).call(abi.encodeWithSignature("emergencyWithdrawNative(address)", GUARDIAN));
+        (bool e,) = address(vault).call(abi.encodeWithSignature("emergencyWithdrawToken(address,address)", address(reward), GUARDIAN));
+        (bool f,) = address(vault).call(abi.encodeWithSignature("emergencyRescueReward(address)", GUARDIAN));
+        (bool g,) = address(vault).call(abi.encodeWithSignature("scheduleEmergencyRescue()"));
+        (bool h,) = address(vault).call(abi.encodeWithSignature("setPauseManager(address)", GUARDIAN));
+        assertTrue(!a && !b && !c && !d && !e && !f && !g && !h, "no pause/hatch selector may exist");
+    }
+
+    /// Claims and buys are ALWAYS available (no pause can ever gate them).
+    function testClaimAndBuyAlwaysAvailable() public {
         _buy(alice, 0);
         _armKeeper();
         _freshFeeds();
         vm.deal(address(vault), 10 ether);
-
-        // give alice some pending first
         _sell(1e18, 0);
-        assertGt(vault.pendingRewards(alice), 0);
 
-        // guardian pauses acquisition
-        vm.prank(GUARDIAN);
-        vault.pauseAcquisition();
-        assertTrue(vault.acquisitionPaused());
-
-        // sell now reverts
-        reward.mint(keeper, 1e18);
-        vm.startPrank(keeper);
-        reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Acquisition paused / 收购已暂停"));
-        vault.sellRewardToVault(1e18, 0);
-        vm.stopPrank();
-
-        // claim STILL works
         uint256 pending = vault.pendingRewards(alice);
+        assertGt(pending, 0);
         vm.prank(alice);
         uint256 got = vault.claimRewards();
         assertApproxEqAbs(got, pending, 100);
 
-        // guardian can resume
-        vm.prank(GUARDIAN);
-        vault.resumeAcquisition();
-        assertFalse(vault.acquisitionPaused());
+        // buying a new rig also always works (no pause)
+        _buy(bob, 0);
+        (uint256 count,,,,) = vault.getUserMinerStats(bob);
+        assertEq(count, 1);
     }
 
     function testSellDisabledByDefault() public {
@@ -619,7 +630,7 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Over per-fill cap / 超过单次上限"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
@@ -633,11 +644,11 @@ contract RamMiningVaultTest is Test {
 
         vm.prank(GUARDIAN);
         vm.expectRevert(bytes(unicode"Premium out of range / 溢价超范围"));
-        vault.setKeeperPremium(10301); // above MAX
+        vault.setKeeperPremium(10401); // above MAX (10400)
 
         vm.prank(GUARDIAN);
-        vault.setKeeperPremium(10150);
-        assertEq(vault.keeperPremiumBps(), 10150);
+        vault.setKeeperPremium(10350); // within [10200, 10400]
+        assertEq(vault.keeperPremiumBps(), 10350);
     }
 
     // ── claim safety: reward token that reverts the transfer ───────────
@@ -671,109 +682,30 @@ contract RamMiningVaultTest is Test {
         assertApproxEqAbs(got, alicePending, 100);
     }
 
-    // ── emergency reward rescue (must-fix #3 + blocker #3 pause-gate) ───
+    // ── oracle-guard staleness ceilings (T5: dead-feed wall + tight BNB) ──
 
-    function testEmergencyRescueRequiresPauseManager() public {
-        // no pause oracle wired -> cannot even schedule
+    /// setOracleGuards clamps each staleness to its ceiling: NVDA/USD ≤ 30d (dead-feed wall), BNB/USD ≤ 1d (24/7).
+    function testSetOracleGuardsCeilings() public {
+        // reward-feed staleness above MAX_REWARD_FEED_STALE (30d) -> revert
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Pause oracle not set / 未设置暂停预言机"));
-        vault.scheduleEmergencyRescue();
-    }
+        vm.expectRevert(bytes(unicode"Reward staleness too loose / 奖励过期阈值过松"));
+        vault.setOracleGuards(200, 2 hours, 31 days);
 
-    function testEmergencyRescueRequiresTokenPausedToSchedule() public {
-        MockPauseManager pm = new MockPauseManager();
+        // BNB-feed staleness above MAX_BNB_FEED_STALE (1d) -> revert
         vm.prank(GUARDIAN);
-        vault.setPauseManager(address(pm));
+        vm.expectRevert(bytes(unicode"BNB staleness too loose / BNB过期阈值过松"));
+        vault.setOracleGuards(200, 2 days, 7 days);
 
-        // pause oracle says NOT paused -> schedule reverts
+        // valid: NVDA 7d, BNB 6h
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Reward not paused / 奖励未暂停"));
-        vault.scheduleEmergencyRescue();
-    }
+        vault.setOracleGuards(200, 6 hours, 7 days);
+        assertEq(vault.rewardFeedMaxStale(), 7 days);
+        assertEq(vault.bnbFeedMaxStale(), 6 hours);
 
-    function testEmergencyRescuePauseGatedTimelock() public {
-        _buy(alice, 0);
-        _inject(10 ether); // vault holds reward
-
-        MockPauseManager pm = new MockPauseManager();
+        // a guardian can tighten toward Flap's 24/7 feed (e.g. 12h) once it is wired
         vm.prank(GUARDIAN);
-        vault.setPauseManager(address(pm));
-        pm.setPaused(true); // reward token is paused (per the compliance oracle)
-
-        // not scheduled -> reverts
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Rescue not scheduled / 未安排救援"));
-        vault.emergencyRescueReward(GUARDIAN);
-
-        vm.prank(GUARDIAN);
-        vault.scheduleEmergencyRescue();
-
-        // too early
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Timelock not elapsed / 时间锁未到"));
-        vault.emergencyRescueReward(GUARDIAN);
-
-        vm.warp(block.timestamp + vault.RESCUE_TIMELOCK());
-        uint256 bal = reward.balanceOf(address(vault));
-        vm.prank(GUARDIAN);
-        vault.emergencyRescueReward(GUARDIAN);
-        assertEq(reward.balanceOf(GUARDIAN), bal);
-    }
-
-    function testEmergencyRescueSelfCancelsIfPauseLifted() public {
-        _buy(alice, 0);
-        _inject(10 ether);
-
-        MockPauseManager pm = new MockPauseManager();
-        vm.prank(GUARDIAN);
-        vault.setPauseManager(address(pm));
-        pm.setPaused(true);
-
-        vm.prank(GUARDIAN);
-        vault.scheduleEmergencyRescue();
-        vm.warp(block.timestamp + vault.RESCUE_TIMELOCK());
-
-        // pause lifted during the timelock -> execute CONSUMES the schedule WITHOUT transferring (no revert)
-        pm.setPaused(false);
-        uint256 vaultBalBefore = reward.balanceOf(address(vault));
-        vm.prank(GUARDIAN);
-        vault.emergencyRescueReward(GUARDIAN);
-        assertEq(reward.balanceOf(address(vault)), vaultBalBefore, "nothing transferred");
-        assertEq(reward.balanceOf(GUARDIAN), 0);
-        assertFalse(vault.rescueScheduled(), "schedule consumed");
-
-        // a transient re-pause cannot drain on the old elapsed timelock: a fresh schedule + new 30d wait is needed
-        pm.setPaused(true);
-        vm.prank(GUARDIAN);
-        vault.scheduleEmergencyRescue();
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Timelock not elapsed / 时间锁未到"));
-        vault.emergencyRescueReward(GUARDIAN);
-    }
-
-    function testEmergencyRescueOnlyGuardian() public {
-        vm.expectRevert(bytes(unicode"Only Guardian / 仅 Guardian"));
-        vault.scheduleEmergencyRescue();
-    }
-
-    function testSetPauseManagerSetOnce() public {
-        MockPauseManager pm1 = new MockPauseManager();
-        MockPauseManager pm2 = new MockPauseManager();
-        vm.prank(GUARDIAN);
-        vault.setPauseManager(address(pm1));
-        assertEq(vault.pauseManager(), address(pm1));
-
-        // cannot be changed afterwards (anti-spoof: would require a timelocked beacon upgrade)
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Pause oracle already set / 暂停预言机已设置"));
-        vault.setPauseManager(address(pm2));
-    }
-
-    function testEmergencyWithdrawTokenCannotDrainReward() public {
-        _inject(10 ether);
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Use emergencyRescueReward / 请用奖励救援"));
-        vault.emergencyWithdrawToken(address(reward), GUARDIAN);
+        vault.setOracleGuards(200, 2 hours, 12 hours);
+        assertEq(vault.rewardFeedMaxStale(), 12 hours);
     }
 
     // ── edges / audit-fix coverage ─────────────────────────────────────
@@ -804,68 +736,12 @@ contract RamMiningVaultTest is Test {
         rb.buy{value: price + 1 ether}(vault, 0);
     }
 
-    function testPausableBlocksBuy() public {
-        vm.prank(GUARDIAN);
-        vault.pauseVault();
-        (uint256 price,,,) = vault.getPlan(0);
-        vm.prank(alice);
-        vm.expectRevert();
-        vault.buyMiningContract{value: price}(0);
-
-        vm.prank(GUARDIAN);
-        vault.unpauseVault();
-        _buy(alice, 0);
-        (uint256 count,,,,) = vault.getUserMinerStats(alice);
-        assertEq(count, 1);
-    }
-
     function testBuyAfterSeasonEndReverts() public {
         vm.warp(seasonEnd + 1);
         (uint256 price,,,) = vault.getPlan(0);
         vm.prank(alice);
         vm.expectRevert(bytes(unicode"Mining season ended / 挖矿赛季已结束"));
         vault.buyMiningContract{value: price}(0);
-    }
-
-    function testEmergencyWithdrawNativeTimelock() public {
-        vm.deal(address(vault), 3 ether);
-
-        // without a schedule -> reverts
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Withdraw not scheduled / 未安排提取"));
-        vault.emergencyWithdrawNative(GUARDIAN);
-
-        // schedule, but execute before the timelock -> reverts
-        vm.prank(GUARDIAN);
-        vault.scheduleEmergencyWithdrawNative();
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Timelock not elapsed / 时间锁未到"));
-        vault.emergencyWithdrawNative(GUARDIAN);
-
-        // after the 7-day timelock -> succeeds, drains BNB
-        vm.warp(block.timestamp + vault.NATIVE_WITHDRAW_TIMELOCK());
-        uint256 balBefore = GUARDIAN.balance;
-        vm.prank(GUARDIAN);
-        vault.emergencyWithdrawNative(GUARDIAN);
-        assertEq(address(vault).balance, 0);
-        assertEq(GUARDIAN.balance, balBefore + 3 ether);
-
-        // schedule is consumed -> a second withdraw needs a fresh schedule
-        vm.deal(address(vault), 1 ether);
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Withdraw not scheduled / 未安排提取"));
-        vault.emergencyWithdrawNative(GUARDIAN);
-    }
-
-    function testScheduleEmergencyWithdrawNativeOnlyGuardian() public {
-        vm.expectRevert(bytes(unicode"Only Guardian / 仅 Guardian"));
-        vault.scheduleEmergencyWithdrawNative();
-    }
-
-    function testEmergencyWithdrawNativeOnlyGuardian() public {
-        vm.deal(address(vault), 1 ether);
-        vm.expectRevert(bytes(unicode"Only Guardian / 仅 Guardian"));
-        vault.emergencyWithdrawNative(alice);
     }
 
     // ── adversarial gate: blockers #1, #4, #5, #7, #9 ──────────────────
@@ -913,13 +789,13 @@ contract RamMiningVaultTest is Test {
 
         uint256 amount = 1e18;
         uint256 received = amount - (amount * fee.FEE_BPS()) / 10000; // 0.99e18
-        uint256 expectedOwed = v.quoteSellToVault(received);
+        uint256 expectedOwed = v.quoteRWAToVault(received);
 
         fee.mint(keeper, amount);
         uint256 keeperBnbBefore = keeper.balance;
         vm.startPrank(keeper);
         fee.approve(address(v), amount);
-        uint256 owed = v.sellRewardToVault(amount, 0);
+        uint256 owed = v.sellRWAToVault(amount, 0);
         vm.stopPrank();
 
         assertEq(owed, expectedOwed, "paid on received delta");
@@ -927,7 +803,7 @@ contract RamMiningVaultTest is Test {
         assertEq(fee.balanceOf(address(v)), received, "vault holds the real delta");
         assertApproxEqAbs(v.pendingRewards(alice), received, 100);
         // nominal-based payout would have been strictly larger -> confirms we did NOT overpay
-        assertGt(v.quoteSellToVault(amount), expectedOwed);
+        assertGt(v.quoteRWAToVault(amount), expectedOwed);
     }
 
     /// must-fix #5/#8 reentrancy wall: a keeper that re-enters from its BNB receive() is blocked by nonReentrant.
@@ -940,7 +816,7 @@ contract RamMiningVaultTest is Test {
         ReentrantKeeper atk = new ReentrantKeeper(vault, IERC20(address(reward)));
         reward.mint(address(atk), 5e18);
         uint256 amount = 1e18;
-        uint256 quoted = vault.quoteSellToVault(amount);
+        uint256 quoted = vault.quoteRWAToVault(amount);
 
         atk.attack(amount);
 
@@ -1016,7 +892,7 @@ contract RamMiningVaultTest is Test {
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
         vm.expectRevert(bytes(unicode"Arm reference price first / 请先设置参考价"));
-        vault.sellRewardToVault(1e18, 0);
+        vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
 
         // re-arming the reference restores sells
@@ -1024,24 +900,7 @@ contract RamMiningVaultTest is Test {
         assertGt(_sell(1e18, 0), 0);
     }
 
-    /// blocker #4a: a frozen NVDA/USD feed (older than the tight 1h default) makes sell REVERT = de-facto pause.
-    function testFrozenFeedDeFactoPausesSell() public {
-        _buy(alice, 0);
-        _armKeeper();
-        vm.deal(address(vault), 10 ether);
-
-        bnbFeed.refresh(); // BNB feed fresh (24/7)
-        nvdaFeed.setUpdatedAt(block.timestamp - 90 minutes); // > 1h default -> stale (market closed)
-
-        reward.mint(keeper, 1e18);
-        vm.startPrank(keeper);
-        reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Stale feed / 预言机数据过期"));
-        vault.sellRewardToVault(1e18, 0);
-        vm.stopPrank();
-    }
-
-    // ── factory upgrade timelock ───────────────────────────────────────
+    // ── factory upgrade timelock + lock (recovery = Guardian-only upgrade) ──
 
     function testUpgradeTimelock() public {
         RamMiningVaultUpgradeable newImpl = new RamMiningVaultUpgradeable();
@@ -1063,6 +922,29 @@ contract RamMiningVaultTest is Test {
         RamMiningVaultUpgradeable newImpl = new RamMiningVaultUpgradeable();
         vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
         factory.scheduleUpgrade(address(newImpl));
+    }
+
+    /// Rule 009 (proxy): upgrade authority is Guardian-only — the Guardian can commit to immutability via lock.
+    function testGuardianCanLockVaultUpgrades() public {
+        assertFalse(factory.isVaultUpgradesLocked());
+        vm.prank(GUARDIAN);
+        factory.lockVaultUpgrades();
+        assertTrue(factory.isVaultUpgradesLocked());
+
+        // after locking, even the Guardian can no longer execute an upgrade (beacon ownership renounced)
+        RamMiningVaultUpgradeable newImpl = new RamMiningVaultUpgradeable();
+        vm.prank(GUARDIAN);
+        factory.scheduleUpgrade(address(newImpl));
+        vm.warp(block.timestamp + factory.UPGRADE_DELAY());
+        vm.prank(GUARDIAN);
+        vm.expectRevert(); // UpgradeableBeacon: caller is not the owner (ownership renounced)
+        factory.executeUpgrade();
+    }
+
+    function testNonGuardianCannotLockVaultUpgrades() public {
+        vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
+        factory.lockVaultUpgrades();
+        assertFalse(factory.isVaultUpgradesLocked());
     }
 
     // ── invariants ─────────────────────────────────────────────────────
