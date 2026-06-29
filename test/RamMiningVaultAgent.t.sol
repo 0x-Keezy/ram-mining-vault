@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
-import {RamMiningBeaconFactory, RamMiningVaultUpgradeable, IRamSwapRouter} from "../src/RamMiningVault.sol";
+import {RamMiningBeaconFactory, RamMiningVaultUpgradeable} from "../src/RamMiningVault.sol";
 import {ITriggerReceiver} from "../src/flap/IFlapTriggerService.sol";
 
 contract AgentRewardToken is ERC20 {
@@ -14,36 +14,17 @@ contract AgentRewardToken is ERC20 {
     }
 }
 
-contract AgentSwapRouter is IRamSwapRouter {
-    AgentRewardToken public reward;
-    address public wbnb = address(0x1111);
+/// @dev Minimal Chainlink feed mock (8 dec) — the agent tests never sell, feeds just need to be valid.
+contract AgentPriceFeed {
+    uint8 public decimals = 8;
+    int256 internal _answer;
 
-    constructor(AgentRewardToken _reward) {
-        reward = _reward;
+    constructor(int256 answer_) {
+        _answer = answer_;
     }
 
-    function WETH() external view override returns (address) {
-        return wbnb;
-    }
-
-    function getAmountsOut(uint256 amountIn, address[] calldata) external pure override returns (uint256[] memory amounts) {
-        amounts = new uint256[](2);
-        amounts[0] = amountIn;
-        amounts[1] = amountIn; // mock 1:1 quote, matches swapExactETHForTokens
-    }
-
-    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata, address to, uint256)
-        external
-        payable
-        override
-        returns (uint256[] memory amounts)
-    {
-        uint256 out = msg.value;
-        require(out >= amountOutMin, "slippage");
-        reward.mint(to, out);
-        amounts = new uint256[](2);
-        amounts[0] = msg.value;
-        amounts[1] = out;
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, _answer, block.timestamp, block.timestamp, 1);
     }
 }
 
@@ -85,7 +66,8 @@ contract RamMiningVaultAgentTest is Test {
     address alice = address(0xA11CE);
 
     AgentRewardToken reward;
-    AgentSwapRouter router;
+    AgentPriceFeed nvdaFeed;
+    AgentPriceFeed bnbFeed;
     MockAIProvider ai;
     MockTriggerService triggerSvc;
     RamMiningBeaconFactory factory;
@@ -97,20 +79,22 @@ contract RamMiningVaultAgentTest is Test {
         vm.chainId(97);
         vm.warp(10 days);
         reward = new AgentRewardToken();
-        router = new AgentSwapRouter(reward);
+        nvdaFeed = new AgentPriceFeed(130e8);
+        bnbFeed = new AgentPriceFeed(600e8);
         ai = new MockAIProvider();
         triggerSvc = new MockTriggerService();
         factory = new RamMiningBeaconFactory();
 
         uint256 seasonEnd = block.timestamp + 60 days;
-        bytes memory vaultData = abi.encode(address(reward), address(router), basePrice, seasonEnd);
+        bytes memory vaultData =
+            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vaultData)));
 
         vm.prank(GUARDIAN);
-        vault.configureAgent(address(ai), address(triggerSvc), 1, 0, uint64(1 days), 2000);
+        vault.configureAgent(address(ai), address(triggerSvc), 1, 0, uint64(1 days));
 
-        // an active miner + BNB reserve for the agent to deploy
+        // an active miner + BNB reserve
         vm.deal(alice, 10 ether);
         (uint256 price,,,) = vault.getPlan(0);
         vm.prank(alice);
@@ -119,7 +103,6 @@ contract RamMiningVaultAgentTest is Test {
     }
 
     function _fulfill(uint8 choice) internal {
-        // real flow: request first (sets lastReasoningRequestId via the mock AI), then fulfill with THAT id
         vm.prank(GUARDIAN);
         uint256 id = vault.requestReasoning();
         ai.fulfill(address(vault), id, choice);
@@ -129,13 +112,7 @@ contract RamMiningVaultAgentTest is Test {
 
     function testConfigureAgentOnlyGuardian() public {
         vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
-        vault.configureAgent(address(ai), address(triggerSvc), 1, 0, uint64(1 days), 2000);
-    }
-
-    function testConfigureAgentRejectsBadDcaBps() public {
-        vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Bad DCA bps / DCA 比例错误"));
-        vault.configureAgent(address(ai), address(triggerSvc), 1, 0, uint64(1 days), 9000); // > MAX
+        vault.configureAgent(address(ai), address(triggerSvc), 1, 0, uint64(1 days));
     }
 
     function testOnlyProviderCanFulfill() public {
@@ -147,53 +124,60 @@ contract RamMiningVaultAgentTest is Test {
         vm.prank(GUARDIAN);
         uint256 id = vault.requestReasoning();
         vm.expectRevert(bytes(unicode"Invalid lever / 无效杠杆"));
-        ai.fulfill(address(vault), id, 6);
+        ai.fulfill(address(vault), id, 5); // LEVER_COUNT == 5 -> 5 is out of range
     }
 
     // ── levers ───────────────────────────────────────────────────────────
 
     function testLeverHoldNoop() public {
-        uint256 pendingBefore = vault.pendingRewards(alice);
+        uint256 premiumBefore = vault.keeperPremiumBps();
         _fulfill(0);
         assertEq(vault.lastLever(), 0);
-        assertEq(vault.pendingRewards(alice), pendingBefore);
+        assertEq(vault.keeperPremiumBps(), premiumBefore);
     }
 
-    function testLeverDcaBuysAndDistributes() public {
-        assertEq(vault.pendingRewards(alice), 0);
-        _fulfill(1); // DCA: 20% of 10 BNB = 2 BNB -> 2 tNVDA (1:1 mock) -> all to alice (only miner)
-        assertApproxEqAbs(vault.pendingRewards(alice), 2 ether, 1e6);
-        assertEq(vault.totalNativeDeployed(), 2 ether);
-        assertGt(vault.dcaCooldownUntil(), block.timestamp);
+    function testLeverRetainNoop() public {
+        uint256 premiumBefore = vault.keeperPremiumBps();
+        _fulfill(3);
+        assertEq(vault.lastLever(), 3);
+        assertEq(vault.keeperPremiumBps(), premiumBefore);
     }
 
-    function testLeverDcaRespectsCooldown() public {
+    function testLeverRaisePremium() public {
+        uint256 before = vault.keeperPremiumBps();
         _fulfill(1);
-        uint256 deployed = vault.totalNativeDeployed();
-        _fulfill(1); // within cooldown -> no-op
-        assertEq(vault.totalNativeDeployed(), deployed);
+        assertEq(vault.keeperPremiumBps(), before + vault.PREMIUM_STEP_BPS());
     }
 
-    function testLeverRaiseAndLowerDcaClamped() public {
+    function testLeverLowerPremium() public {
+        // raise once so there's room to lower
+        _fulfill(1);
+        uint256 raised = vault.keeperPremiumBps();
+        _fulfill(2);
+        assertEq(vault.keeperPremiumBps(), raised - vault.PREMIUM_STEP_BPS());
+    }
+
+    function testLeverRaiseAndLowerPremiumClamped() public {
         // raise to MAX
-        for (uint256 i = 0; i < 10; i++) {
-            _fulfill(3);
-        }
-        assertEq(vault.dcaPercentBps(), vault.MAX_DCA_BPS());
-        // lower to MIN
         for (uint256 i = 0; i < 20; i++) {
-            _fulfill(4);
+            _fulfill(1);
         }
-        assertEq(vault.dcaPercentBps(), vault.MIN_DCA_BPS());
+        assertEq(vault.keeperPremiumBps(), vault.MAX_PREMIUM_BPS());
+        // lower to MIN (never below 100%)
+        for (uint256 i = 0; i < 40; i++) {
+            _fulfill(2);
+        }
+        assertEq(vault.keeperPremiumBps(), vault.MIN_PREMIUM_BPS());
     }
 
-    // ── tiered autonomy: high-impact lever 5 is queued behind a timelock ──
+    // ── tiered autonomy: high-impact lever 4 is queued behind a timelock ──
 
     function testLeverPauseIsQueuedNotImmediate() public {
-        _fulfill(5);
+        _fulfill(4);
         assertTrue(vault.hasQueuedAction());
-        assertEq(vault.queuedLever(), 5);
-        // rig sales NOT paused yet (only queued)
+        assertEq(vault.queuedLever(), 4);
+        // acquisition NOT paused yet (only queued); rig sales unaffected
+        assertFalse(vault.acquisitionPaused());
         (uint256 price,,,) = vault.getPlan(0);
         vm.deal(alice, 1 ether);
         vm.prank(alice);
@@ -201,8 +185,7 @@ contract RamMiningVaultAgentTest is Test {
     }
 
     function testQueuedActionTimelockThenExecute() public {
-        _fulfill(5);
-        // too early
+        _fulfill(4);
         vm.prank(GUARDIAN);
         vm.expectRevert(bytes(unicode"Timelock not elapsed / 时间锁未到"));
         vault.executeQueuedAction();
@@ -211,35 +194,36 @@ contract RamMiningVaultAgentTest is Test {
         vm.prank(GUARDIAN);
         vault.executeQueuedAction();
 
-        // now sales are paused
-        (uint256 price,,,) = vault.getPlan(0);
-        vm.deal(alice, 1 ether);
-        vm.prank(alice);
-        vm.expectRevert();
-        vault.buyMiningContract{value: price}(0);
+        // now acquisition is paused (claims unaffected, rig sales unaffected)
+        assertTrue(vault.acquisitionPaused());
     }
 
     function testCancelQueuedAction() public {
-        _fulfill(5);
+        _fulfill(4);
         vm.prank(GUARDIAN);
         vault.cancelQueuedAction();
         assertFalse(vault.hasQueuedAction());
     }
 
     function testExecuteQueuedOnlyGuardian() public {
-        _fulfill(5);
+        _fulfill(4);
         vm.warp(block.timestamp + vault.ACTION_TIMELOCK());
         vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
         vault.executeQueuedAction();
     }
 
-    // claims keep working even when sales are paused (never trap funds)
-    function testClaimWorksWhilePaused() public {
-        _fulfill(1); // give alice some reward
-        _fulfill(5);
+    // claims keep working even when acquisition is paused (never trap funds)
+    function testClaimWorksWhileAcquisitionPaused() public {
+        // fund alice's pending via donate
+        reward.mint(address(this), 100 ether);
+        reward.approve(address(vault), type(uint256).max);
+        vault.donateReward(50 ether);
+
+        _fulfill(4);
         vm.warp(block.timestamp + vault.ACTION_TIMELOCK());
         vm.prank(GUARDIAN);
-        vault.executeQueuedAction(); // pauses sales
+        vault.executeQueuedAction(); // pauses acquisition
+        assertTrue(vault.acquisitionPaused());
 
         uint256 pending = vault.pendingRewards(alice);
         assertGt(pending, 0);
@@ -262,17 +246,47 @@ contract RamMiningVaultAgentTest is Test {
         uint256 armedId = vault.lastTriggerRequestId();
         assertGt(armedId, 0);
 
-        // trigger service fires the epoch callback
         triggerSvc.fire(address(vault), armedId);
-        assertGt(vault.lastReasoningRequestId(), 0); // reasoning requested
-        assertGt(vault.lastTriggerRequestId(), armedId); // re-armed next epoch
+        assertGt(vault.lastReasoningRequestId(), 0);
+        assertGt(vault.lastTriggerRequestId(), armedId);
     }
 
     function testAutoTriggerDisabledIsNoop() public {
-        // autoTrigger is off by default (configureAgent does not enable it)
         assertFalse(vault.autoTriggerEnabled());
-        triggerSvc.fire(address(vault), 1); // should just return
+        triggerSvc.fire(address(vault), 1);
         assertEq(vault.lastReasoningRequestId(), 0);
+    }
+
+    // ── B2 anti-replay: requestId is validated AND consumed (retryUndelivered/retryTrigger are public) ──
+
+    function testFulfillRejectsReplayedRequestId() public {
+        vm.prank(GUARDIAN);
+        uint256 id = vault.requestReasoning();
+        ai.fulfill(address(vault), id, 1); // first fulfillment consumes lastReasoningRequestId
+        assertEq(vault.lastReasoningRequestId(), 0);
+
+        // replaying the SAME (already consumed) id must revert — a stale decision can't re-apply to fresh funds
+        vm.expectRevert(bytes(unicode"Stale/unknown reasoning / 推理ID无效"));
+        ai.fulfill(address(vault), id, 1);
+    }
+
+    function testFulfillRejectsUnknownRequestId() public {
+        vm.prank(GUARDIAN);
+        vault.requestReasoning(); // arms lastReasoningRequestId
+        // a different id than the pending one must revert
+        vm.expectRevert(bytes(unicode"Stale/unknown reasoning / 推理ID无效"));
+        ai.fulfill(address(vault), 999_999, 1);
+    }
+
+    function testTriggerRejectsReplayedRequestId() public {
+        vm.prank(GUARDIAN);
+        vault.startEpochLoop();
+        uint256 armedId = vault.lastTriggerRequestId();
+
+        triggerSvc.fire(address(vault), armedId); // consumes armedId, re-arms a fresh one
+        // firing the old (consumed) trigger id again must revert
+        vm.expectRevert(bytes(unicode"Stale/unknown trigger / 触发ID无效"));
+        triggerSvc.fire(address(vault), armedId);
     }
 
     receive() external payable {}

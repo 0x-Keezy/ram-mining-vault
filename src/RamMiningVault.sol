@@ -12,6 +12,7 @@ import {
     ApproveAction
 } from "./flap/IVaultSchemasV1.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {BeaconProxy} from "@openzeppelin/proxy/beacon/BeaconProxy.sol";
 import {UpgradeableBeacon} from "@openzeppelin/proxy/beacon/UpgradeableBeacon.sol";
@@ -21,23 +22,35 @@ import {PausableUpgradeable} from "@openzeppelin-contracts-upgradeable/security/
 import {FlapAIConsumerBase, IFlapAIProvider} from "./flap/IFlapAIProvider.sol";
 import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.sol";
 
-/// @notice Minimal PancakeSwap/Uniswap-V2 router surface used to swap native BNB into the reward token.
-interface IRamSwapRouter {
-    function WETH() external view returns (address);
-    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
-    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)
+/// @notice Minimal Chainlink price-feed surface (NVDA/USD and BNB/USD, 8 decimals on BNB Chain).
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function latestRoundData()
         external
-        payable
-        returns (uint256[] memory amounts);
+        view
+        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
+/// @notice Optional, minimal "is this reward token paused?" oracle used only to ARM the emergency-rescue hatch.
+///         If the reward token (e.g. NVDAB) exposes a pause manager, wiring it here lets the rescue path verify
+///         the pause condition on-chain. If unset, the rescue path falls back to the long timelock alone.
+interface IPauseManager {
+    function isTokenPaused(address token) external view returns (bool);
 }
 
 /// @title RamMiningVaultUpgradeable
-/// @notice Flap V2 real-yield mining vault for the RAM project.
+/// @notice Flap V2 real-yield mining vault for the RAM project — KEEPER/RFQ model (v2).
 /// @dev Users buy native-BNB "rig" contracts that grant mining `power`. The vault's reward comes from REAL
-///      trading fees: the RAM tax token routes its `market` fee share (in BNB) to this vault; the vault swaps
-///      that BNB into a reward token (tokenized NVIDIA, e.g. NVDAx) and distributes it pro-rata to active power
-///      using a MasterChef-style accumulator (`accRewardPerPower`). Rigs expire per-rig; expiry is settled lazily
-///      by time buckets (no paid keeper). NO buyback & burn — capital is reinvested into the reward asset.
+///      trading fees: the RAM tax token routes its `market` fee share (in BNB) to this vault. Instead of swapping
+///      BNB on a DEX (v1), a keeper sells the reward token (tokenized NVIDIA, NVDAB) INTO the vault at the
+///      Chainlink oracle price plus a small, clamped premium (`sellRewardToVault`): the vault pays BNB and
+///      receives NVDAB, which it distributes pro-rata to active power using a MasterChef-style accumulator
+///      (`accRewardPerPower`). Rigs expire per-rig; expiry is settled lazily by time buckets (no paid keeper).
+///      NO buyback & burn — capital is reinvested into the reward asset.
+///
+///      v2 inverts the cash flow (BNB LEAVES the vault to a permissionless keeper), so the oracle + a clamped
+///      premium + a per-fill cap + a per-window rate-limit + a deviation band + hard feed-staleness checks are
+///      the wall against treasury drain. See the §8b must-fix set in the design doc.
 contract RamMiningVaultUpgradeable is
     Initializable,
     VaultBaseV2,
@@ -53,22 +66,55 @@ contract RamMiningVaultUpgradeable is
     uint256 public constant ACC_PRECISION = 1e12;
     uint256 public constant BUCKET = 1 days; // expiry granularity
     uint256 public constant EMERGENCY_COOLDOWN = 1 days;
+    uint256 public constant BPS_DENOM = 10000;
 
-    // economic-agent clamps
-    uint8 public constant LEVER_COUNT = 6;
-    uint256 public constant MIN_DCA_BPS = 500; // 5%
-    uint256 public constant MAX_DCA_BPS = 5000; // 50%
-    uint256 public constant DCA_MAX_SLIPPAGE_BPS = 300; // 3% — max slippage tolerated by the autonomous DCA swap (anti-MEV)
-    uint256 public constant DCA_STEP_BPS = 500; // 5%
-    uint256 public constant DCA_COOLDOWN = 6 hours;
+    // --- economic-agent clamps (keeper premium) ---
+    uint8 public constant LEVER_COUNT = 5; // 0 HOLD · 1 RAISE_PREMIUM · 2 LOWER_PREMIUM · 3 RETAIN · 4 PAUSE_ACQUISITION
+    /// @dev Hard, IMMUTABLE floor: the keeper premium can never drop below 100% of oracle market value. The premium
+    ///      only ever goes IN FAVOUR of miners — the AI can never pay the keeper BELOW market at the miners' expense.
+    uint256 public constant MIN_PREMIUM_BPS = 10000; // 100% (no discount, ever)
+    /// @dev Conservative ceiling (+3%). This is a compile-time constant: RAISING the cap requires upgrading the
+    ///      beacon implementation, which is itself gated behind the factory's 2-day upgrade timelock + guardian.
+    ///      That satisfies must-fix #6 ("MAX no subible sin timelock") without adding a separate mutable cap.
+    uint256 public constant MAX_PREMIUM_BPS = 10300; // 103% (+3% absolute ceiling)
+    uint256 public constant PREMIUM_STEP_BPS = 50; // 0.5% per AI lever step
     uint256 public constant ACTION_TIMELOCK = 12 hours;
+
+    // --- keeper egress safety ---
+    uint256 public constant WINDOW = 1 days; // rolling rate-limit window for BNB egress
+    uint256 public constant RESCUE_TIMELOCK = 30 days; // long timelock for the emergency reward-rescue hatch
+    uint256 public constant NATIVE_WITHDRAW_TIMELOCK = 7 days; // timelock for the full-BNB emergency withdraw
 
     // --- config (set at initialize) ---
     address public taxToken; // RAM token (fee source; not held by this vault directly)
-    address public rewardToken; // tokenized NVIDIA distributed to miners (e.g. NVDAx)
-    address public swapRouter; // PancakeSwap router for BNB -> rewardToken
+    address public rewardToken; // tokenized NVIDIA distributed to miners (NVDAB)
+    address public rewardPriceFeed; // Chainlink NVDA/USD feed (8 decimals)
+    address public bnbPriceFeed; // Chainlink BNB/USD feed (8 decimals)
+    uint8 public rewardTokenDecimals; // IERC20Metadata(rewardToken).decimals() read at initialize (NOT assumed 18)
     uint256 public basePriceWei; // Micro rig price in BNB
     uint256 public seasonEnd; // rigs cannot mine past this timestamp
+
+    // --- keeper / RFQ acquisition (replaces v1 DEX swap) ---
+    uint256 public keeperPremiumBps; // premium paid to the keeper over oracle market value (default 10200 = +2%)
+    uint256 public maxBnbOutPerFill; // absolute cap on BNB paid out in a single sell (guardian-set; 0 = sells disabled)
+    uint256 public maxBnbOutPerWindow; // cap on BNB paid out per WINDOW (guardian-set; 0 = sells disabled)
+    uint256 public bnbOutThisWindow; // BNB paid out so far in the current window
+    uint256 public windowStart; // start timestamp of the current rate-limit window
+    uint256 public priceDeviationBps; // max allowed deviation of the live feed from referencePrice (guardian-set)
+    uint256 public referencePrice; // armed NVDA/USD reference (8 dec); deviation band is enforced only when != 0
+    uint256 public bnbFeedMaxStale; // max staleness for BNB/USD (crypto 24/7 → short, ~1-2h)
+    uint256 public rewardFeedMaxStale; // max staleness for NVDA/USD (stock feed freezes on weekends → sell reverts)
+    bool public acquisitionPaused; // gates sellRewardToVault ONLY; claims are NEVER gated
+    uint256 public lastFillTimestamp; // liveness metric: last successful keeper sell
+
+    // --- emergency reward rescue (worst-case permanent NVDAB pause) ---
+    address public pauseManager; // on-chain pause oracle for the reward token (REQUIRED to arm the rescue condition)
+    uint256 public rescueScheduledAt; // when the rescue hatch was armed (0 = not armed)
+    bool public rescueScheduled; // whether a rescue is currently scheduled
+
+    // --- emergency native (BNB) withdraw — schedule → timelock → execute ---
+    uint256 public nativeWithdrawScheduledAt; // when the full-BNB withdraw was armed (0 = not armed)
+    bool public nativeWithdrawScheduled; // whether a full-BNB withdraw is currently scheduled
 
     // --- real-yield accumulator ---
     uint256 public accRewardPerPower; // reward token per unit of power, scaled by ACC_PRECISION
@@ -82,8 +128,8 @@ contract RamMiningVaultUpgradeable is
     uint256 public totalContractsSold;
     uint256 public totalRewardDistributed; // reward token credited to the accumulator (lifetime)
     uint256 public totalRewardClaimed; // reward token actually claimed (lifetime)
-    uint256 public totalNativePaid;
-    uint256 public totalNativeDeployed; // BNB spent buying reward token
+    uint256 public totalNativePaid; // BNB paid by miners buying rigs (lifetime)
+    uint256 public totalBnbPaidToKeepers; // BNB paid out to keepers via sellRewardToVault (lifetime)
     uint256 public lastContractId;
     uint256 public lastEmergencyWithdraw;
 
@@ -94,13 +140,11 @@ contract RamMiningVaultUpgradeable is
     uint256 public aiReasonFee; // BNB budget per reason() call
     uint64 public epochInterval; // seconds between economic epochs
     bool public autoTriggerEnabled;
-    uint256 public dcaPercentBps; // % of BNB reserve deployed per DCA (clamped MIN_DCA_BPS..MAX_DCA_BPS)
-    uint256 public dcaCooldownUntil;
     uint256 public lastReasoningRequestId;
     uint256 public lastTriggerRequestId;
     uint256 public lastEpochAt;
     uint8 public lastLever;
-    // tiered autonomy: queued high-impact action (lever 5 = pause sales)
+    // tiered autonomy: queued high-impact action (lever 4 = pause acquisition)
     uint8 public queuedLever;
     uint256 public queuedReadyAt;
     bool public hasQueuedAction;
@@ -120,8 +164,9 @@ contract RamMiningVaultUpgradeable is
     mapping(address => Rig[]) private userRigs;
 
     /// @dev Storage gap for safe future upgrades (append-only): when adding new state vars, append them and
-    ///      shrink this gap so the beacon-proxy storage layout never collides.
-    uint256[50] private __gap;
+    ///      shrink this gap so the beacon-proxy storage layout never collides. v2 is a fresh deployment
+    ///      (new beacon implementation), so this reflects the new layout, not an upgrade-in-place of v1.
+    uint256[34] private __gap;
 
     event RigBought(
         address indexed user,
@@ -132,9 +177,21 @@ contract RamMiningVaultUpgradeable is
         uint256 startTime,
         uint256 endTime
     );
-    event RewardClaimed(address indexed user, uint256 amount);
+    event RewardClaimed(address indexed user, address indexed to, uint256 amount);
     event RewardNotified(uint256 amount, uint256 newAccRewardPerPower);
-    event NativeDeployedToReward(uint256 amountInBNB, uint256 rewardOut);
+    event RewardSoldToVault(address indexed keeper, uint256 rewardIn, uint256 bnbOut);
+    event KeeperConfigured(address rewardPriceFeed, address bnbPriceFeed, uint256 keeperPremiumBps);
+    event KeeperLimitsSet(uint256 maxBnbOutPerFill, uint256 maxBnbOutPerWindow);
+    event OracleGuardsSet(uint256 priceDeviationBps, uint256 bnbFeedMaxStale, uint256 rewardFeedMaxStale);
+    event ReferencePriceSet(uint256 referencePrice);
+    event KeeperPremiumSet(uint256 keeperPremiumBps);
+    event AcquisitionPausedSet(bool paused);
+    event PauseManagerSet(address pauseManager);
+    event EmergencyRescueScheduled(uint256 readyAt);
+    event EmergencyRescueCancelled();
+    event EmergencyRescueExecuted(address indexed to, uint256 amount);
+    event EmergencyWithdrawNativeScheduled(uint256 readyAt);
+    event EmergencyWithdrawNativeCancelled();
     event EmergencyWithdrawNative(address indexed to, uint256 amount);
     event EmergencyWithdrawToken(address indexed token, address indexed to, uint256 amount);
     event AgentConfigured(address provider, address triggerService, uint256 modelId);
@@ -152,7 +209,8 @@ contract RamMiningVaultUpgradeable is
     function initialize(
         address _taxToken,
         address _rewardToken,
-        address _swapRouter,
+        address _rewardPriceFeed,
+        address _bnbPriceFeed,
         uint256 _basePriceWei,
         uint256 _seasonEnd
     ) external initializer {
@@ -160,16 +218,37 @@ contract RamMiningVaultUpgradeable is
         __Pausable_init();
         require(_taxToken != address(0), unicode"RAM token required / 需要 RAM 代币地址");
         require(_rewardToken != address(0), unicode"Reward token required / 需要奖励代币地址");
-        require(_swapRouter != address(0), unicode"Router required / 需要路由器地址");
+        require(_rewardPriceFeed != address(0), unicode"Reward feed required / 需要奖励价格预言机");
+        require(_bnbPriceFeed != address(0), unicode"BNB feed required / 需要 BNB 价格预言机");
+        // should-fix #7: the quote math assumes 8-decimal Chainlink feeds (the two feeds cancel). Enforce it so a
+        // mis-wired feed with different decimals can never silently mis-price the keeper payout.
+        require(AggregatorV3Interface(_rewardPriceFeed).decimals() == 8, unicode"Reward feed not 8dec / 奖励预言机非8位");
+        require(AggregatorV3Interface(_bnbPriceFeed).decimals() == 8, unicode"BNB feed not 8dec / BNB预言机非8位");
         require(_basePriceWei > 0, unicode"Base price required / 需要基础价格");
         require(_seasonEnd >= block.timestamp + 1 days, unicode"Season too short / 赛季过短");
 
         taxToken = _taxToken;
         rewardToken = _rewardToken;
-        swapRouter = _swapRouter;
+        rewardPriceFeed = _rewardPriceFeed;
+        bnbPriceFeed = _bnbPriceFeed;
         basePriceWei = _basePriceWei;
         seasonEnd = _seasonEnd;
         lastSettledBucket = block.timestamp / BUCKET;
+
+        // must-fix #7: read the reward token's real decimals (NVDAB = 18, but never assume).
+        rewardTokenDecimals = IERC20Metadata(_rewardToken).decimals();
+
+        // Safe-by-default keeper config. BNB egress caps start at 0 → sells are DISABLED until the guardian
+        // explicitly arms maxBnbOutPerFill / maxBnbOutPerWindow. The premium starts at the Flap baseline (+2%).
+        keeperPremiumBps = 10200; // +2% (matches Flap production KEEPER_QUOTE_BPS / getMultiplier)
+        bnbFeedMaxStale = 2 hours; // crypto feed is 24/7; tight window
+        // TIGHT default so a frozen stock feed (nights/weekends, when NVDAB still trades 24/7) makes `sell` REVERT
+        // = a de-facto acquisition pause while the market is closed (closes the weekend-arbitrage window). The
+        // guardian tunes this to the real NVDA/USD market-hours heartbeat; it must stay below the closed-market gap.
+        rewardFeedMaxStale = 1 hours;
+        priceDeviationBps = 200; // ±2% band vs referencePrice once armed
+        windowStart = block.timestamp;
+        // maxBnbOutPerFill, maxBnbOutPerWindow, referencePrice default to 0 (sells disabled / band off until armed).
     }
 
     /// @notice Accept native BNB. The RAM tax token's TaxProcessor sends the `market` fee share here, and the
@@ -198,6 +277,12 @@ contract RamMiningVaultUpgradeable is
         }
         require(end > start, unicode"No mining time left / 没有剩余挖矿时间");
         uint256 endBucket = end / BUCKET;
+        // BUG FIX (last-bucket brick): _settleExpiries() above advanced lastSettledBucket to nowBucket and the
+        // settle loop only scans buckets > lastSettledBucket. A rig whose endBucket has already been settled
+        // (e.g. near seasonEnd, when end is capped into the current/settled bucket) would inflate totalActivePower
+        // forever (its power never gets subtracted) and read accSnapshotAtBucket==0 → owed underflow → claims
+        // brick for everyone. Reject such rigs: their power must expire in a future, not-yet-settled bucket.
+        require(endBucket > lastSettledBucket, unicode"Rig ends too soon / 套餐过短");
 
         // Refund excess BNB before recording state (safe-order; full revert on failure).
         uint256 refund = msg.value - priceWei;
@@ -229,11 +314,26 @@ contract RamMiningVaultUpgradeable is
         emit RigBought(msg.sender, lastContractId, planId, power, priceWei, start, end);
     }
 
-    // @dev Claims are intentionally NOT gated by whenNotPaused — users can always withdraw their rewards,
-    //      even if rig sales are paused (the agent's freno). Never trap user funds.
+    // @dev Claims are intentionally NOT gated by whenNotPaused NOR by acquisitionPaused — users can always
+    //      withdraw their rewards, even if rig sales or keeper acquisition are paused. Never trap user funds.
     function claimRewards() external nonReentrant returns (uint256 amount) {
+        amount = _claim(msg.sender, msg.sender);
+    }
+
+    /// @notice Claim accumulated rewards to a different recipient — useful if the caller's own address became
+    ///         non-compliant for the (regulated) reward token but a fresh recipient can still receive it.
+    function claimRewardsTo(address to) external nonReentrant returns (uint256 amount) {
+        require(to != address(0), unicode"Bad recipient / 错误接收地址");
+        amount = _claim(msg.sender, to);
+    }
+
+    /// @dev Single accounting+transfer claim path. Effects (rewardDebt/claimed) are mutated BEFORE the one and
+    ///      only `safeTransfer` at the end; if that transfer reverts (reward token paused / recipient non-compliant)
+    ///      the whole tx rolls back atomically, leaving this miner's pending intact and OTHER miners' accounting
+    ///      untouched. No transfers happen inside the rig loop (would open reentrancy). (must-fix #8 alignment.)
+    function _claim(address user, address to) internal returns (uint256 amount) {
         _settleExpiries();
-        Rig[] storage rigs = userRigs[msg.sender];
+        Rig[] storage rigs = userRigs[user];
         for (uint256 i = 0; i < rigs.length; i++) {
             Rig storage r = rigs[i];
             uint256 acc = _rigAcc(r);
@@ -247,58 +347,149 @@ contract RamMiningVaultUpgradeable is
         require(amount > 0, unicode"Nothing to claim / 无可领取");
 
         totalRewardClaimed += amount;
-        IERC20(rewardToken).safeTransfer(msg.sender, amount);
-        emit RewardClaimed(msg.sender, amount);
+        IERC20(rewardToken).safeTransfer(to, amount);
+        emit RewardClaimed(user, to, amount);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    //  Reward funding (real-yield): swap BNB fees into reward token, then notify
+    //  Reward funding (real-yield): keeper/RFQ — keeper sells NVDAB INTO the vault
+    //  at oracle price + clamped premium; the vault pays BNB and distributes NVDAB.
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// @notice Deploy `amountBNB` of the BNB reserve into the reward token and credit it to miners.
-    /// @dev Guardian-gated in Phase 1. In Phase 3 the AI economic agent (within clamps) also calls this.
-    function deployToReward(uint256 amountBNB, uint256 minRewardOut)
+    /// @notice Oracle quote: how much BNB the vault pays for `rewardAmount` of the reward token (NVDAB).
+    /// @dev Reads both Chainlink feeds with HARD staleness/sanity checks (revert on stale/bad price), normalizes
+    ///      `rewardAmount` to 18 decimals via the token's real `decimals()`, then applies the keeper premium.
+    ///      `marketBnb = rewardAmount(18) * nvdaUsd / bnbUsd` (the two 8-dec feeds cancel, leaving BNB wei).
+    ///      Note: within `rewardFeedMaxStale` of the last print the quote uses that (frozen-but-tolerated) price —
+    ///      see `_checkDeviationBand` for the bounded window-frontier arbitrage trade-off and its mitigations.
+    function quoteSellToVault(uint256 rewardAmount) public view returns (uint256 bnbOwed) {
+        uint256 nvdaUsd = _readFeed(rewardPriceFeed, rewardFeedMaxStale); // 8 dec
+        uint256 bnbUsd = _readFeed(bnbPriceFeed, bnbFeedMaxStale); // 8 dec
+        uint256 amount18 = _to18(rewardAmount);
+        uint256 marketBnb = (amount18 * nvdaUsd) / bnbUsd; // 18-dec BNB wei
+        bnbOwed = (marketBnb * keeperPremiumBps) / BPS_DENOM;
+    }
+
+    /// @notice PERMISSIONLESS keeper RFQ: the keeper transfers `rewardAmount` of NVDAB into the vault and is paid
+    ///         `bnbOwed` (oracle price + premium) from the vault's BNB reserve. The received NVDAB is distributed
+    ///         to miners by power. This is the v2 replacement for the v1 DEX swap.
+    /// @dev BNB LEAVES the vault to a permissionless caller, so every drain guard fires here: !paused, oracle
+    ///      staleness (in the quote), per-fill cap, per-window rate-limit, deviation band, balance check. The
+    ///      keeper is paid LAST (CEI), and the credited reward is the REAL measured delta (fee-on-transfer safe).
+    /// @param rewardAmount amount of reward token the keeper sells into the vault.
+    /// @param minBnbOut    keeper slippage floor (the oracle may have moved since they quoted).
+    function sellRewardToVault(uint256 rewardAmount, uint256 minBnbOut)
         external
         nonReentrant
-        returns (uint256 rewardOut)
+        returns (uint256 bnbOwed)
     {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
-        rewardOut = _deployToReward(amountBNB, minRewardOut);
-    }
+        require(!acquisitionPaused, unicode"Acquisition paused / 收购已暂停");
+        require(rewardAmount > 0, unicode"Bad amount / 金额错误");
+        // should-fix #6: settle expiries BEFORE checking effective power, so no BNB leaves once power has lapsed
+        // (e.g. past seasonEnd, where all power is settled to 0 → reverts here instead of paying a keeper).
+        _settleExpiries();
+        require(totalActivePower > 0, unicode"No miners / 没有矿工");
 
-    function _deployToReward(uint256 amountBNB, uint256 minRewardOut) internal returns (uint256 rewardOut) {
-        require(amountBNB > 0 && amountBNB <= address(this).balance, unicode"Bad amount / 金额错误");
-
-        IRamSwapRouter router = IRamSwapRouter(swapRouter);
-        address[] memory path = new address[](2);
-        path[0] = router.WETH();
-        path[1] = rewardToken;
-
+        // must-fix #5/#8: pull FIRST, measure the REAL received delta, and price THAT delta — so a future
+        // fee-on-transfer/rebasing reward token can never make the vault overpay the keeper on a nominal amount.
         uint256 balBefore = IERC20(rewardToken).balanceOf(address(this));
-        router.swapExactETHForTokens{value: amountBNB}(minRewardOut, path, address(this), block.timestamp);
-        rewardOut = IERC20(rewardToken).balanceOf(address(this)) - balBefore;
+        IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), rewardAmount);
+        uint256 received = IERC20(rewardToken).balanceOf(address(this)) - balBefore;
+        require(received > 0, unicode"No reward received / 未收到奖励");
 
-        totalNativeDeployed += amountBNB;
-        _notifyReward(rewardOut);
-        emit NativeDeployedToReward(amountBNB, rewardOut);
+        // price the actual received delta; all drain guards apply to THIS final bnbOwed.
+        bnbOwed = quoteSellToVault(received);
+        require(bnbOwed > 0 && bnbOwed >= minBnbOut, unicode"Slippage / 滑点过大"); // keeper slippage on the FINAL owed
+        require(bnbOwed <= maxBnbOutPerFill, unicode"Over per-fill cap / 超过单次上限");
+
+        // must-fix #1a: deviation band vs the armed reference price (rejects an oracle that jumped/was manipulated).
+        _checkDeviationBand();
+        // must-fix #1c: rolling per-window BNB egress rate-limit.
+        _consumeWindow(bnbOwed);
+
+        require(address(this).balance >= bnbOwed, unicode"Insufficient BNB / BNB 不足");
+
+        _notifyReward(received); // distribute the actual delta by power
+        lastFillTimestamp = block.timestamp; // liveness metric
+        totalBnbPaidToKeepers += bnbOwed;
+
+        // CEI: pay the keeper LAST (reentrancy-guarded above).
+        (bool ok,) = payable(msg.sender).call{value: bnbOwed}("");
+        require(ok, unicode"BNB transfer failed / BNB 转账失败");
+        emit RewardSoldToVault(msg.sender, received, bnbOwed);
     }
 
-    /// @dev On-chain min-out for the autonomous DCA swap: router quote minus a clamped slippage bound (anti-MEV, B1).
-    function _dcaMinOut(uint256 amountBNB) internal view returns (uint256) {
-        IRamSwapRouter router = IRamSwapRouter(swapRouter);
-        address[] memory path = new address[](2);
-        path[0] = router.WETH();
-        path[1] = rewardToken;
-        uint256[] memory outs = router.getAmountsOut(amountBNB, path);
-        return (outs[1] * (10000 - DCA_MAX_SLIPPAGE_BPS)) / 10000;
+    /// @dev Chainlink read with HARD checks (must-fix #2 & #4). Any stale/bad answer REVERTS the whole op — never
+    ///      a silent zero/old price. BNB Chain is L1, so there is NO sequencer-uptime feed to consult (that's L2).
+    function _readFeed(address feed, uint256 maxStale) internal view returns (uint256 price) {
+        (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) =
+            AggregatorV3Interface(feed).latestRoundData();
+        require(answer > 0, unicode"Bad feed price / 预言机价格无效");
+        require(updatedAt != 0, unicode"Round not complete / 轮次未完成");
+        require(answeredInRound >= roundId, unicode"Stale round / 预言机轮次过期");
+        require(block.timestamp - updatedAt <= maxStale, unicode"Stale feed / 预言机数据过期");
+        price = uint256(answer);
+    }
+
+    /// @dev Normalize an amount of reward token to 18 decimals using the token's real `decimals()`.
+    function _to18(uint256 amount) internal view returns (uint256) {
+        uint8 d = rewardTokenDecimals;
+        if (d == 18) return amount;
+        if (d < 18) return amount * (10 ** (18 - d));
+        return amount / (10 ** (d - 18));
+    }
+
+    /// @dev must-fix #1a: reject the sell if the live NVDA/USD feed deviates more than `priceDeviationBps` from the
+    ///      armed `referencePrice`. NOTE: the band compares the SAME feed (live) vs a stored reference, so it is
+    ///      BLIND to a frozen feed (a stale value still sits inside the band) — the weekend/overnight arbitrage
+    ///      risk is NOT resolved by the band. It is mitigated by the HARD staleness check in `_readFeed` (a frozen
+    ///      NVDA/USD feed makes the sell REVERT = a de-facto pause while the market is closed) plus the per-fill /
+    ///      per-window BNB caps. The band's job is narrower: catch a fresh-but-jumped/manipulated oracle print.
+    ///      Sells cannot run until the guardian arms a reference (enforced at setKeeperLimits AND on every sell).
+    ///
+    ///      RESIDUAL ARB (inherent, documented trade-off — NOT a bug): even with the band armed, for up to
+    ///      `rewardFeedMaxStale` after the last feed print the sell executes at the last (frozen-but-tolerated)
+    ///      price, and the band is structurally blind to a frozen feed because it compares the feed against a
+    ///      reference derived from that same feed. That window is BOUNDED by the per-fill and per-window BNB caps,
+    ///      so the worst-case loss is capped. The real future mitigation is a market-open gate; until then the
+    ///      operator must set `rewardFeedMaxStale` ≈ the feed's true market-hours heartbeat (a liveness/arb
+    ///      trade-off: tighter = less arb but more spurious reverts intra-heartbeat).
+    function _checkDeviationBand() internal view {
+        uint256 ref = referencePrice;
+        if (ref == 0) {
+            // INVARIANT (enforced on EVERY sell, not only at setKeeperLimits): egress enabled ⟹ band armed.
+            // If the band was disarmed (setReferencePrice(0) / setPriceFeeds) while caps stayed armed, refuse the
+            // sell rather than run with the band OFF and egress OPEN.
+            require(
+                maxBnbOutPerFill == 0 && maxBnbOutPerWindow == 0, unicode"Arm reference price first / 请先设置参考价"
+            );
+            return;
+        }
+        uint256 live = _readFeed(rewardPriceFeed, rewardFeedMaxStale);
+        uint256 diff = live > ref ? live - ref : ref - live;
+        require(diff * BPS_DENOM <= ref * priceDeviationBps, unicode"Price out of band / 价格超出区间");
+    }
+
+    /// @dev must-fix #1c: rolling-window BNB egress accounting; reverts if this fill would breach the window cap.
+    function _consumeWindow(uint256 amount) internal {
+        if (block.timestamp >= windowStart + WINDOW) {
+            windowStart = block.timestamp;
+            bnbOutThisWindow = 0;
+        }
+        require(bnbOutThisWindow + amount <= maxBnbOutPerWindow, unicode"Over window cap / 超过窗口上限");
+        bnbOutThisWindow += amount;
     }
 
     /// @notice Credit reward tokens already held/received by the vault into the distribution accumulator.
-    /// @dev Pull pattern for externally-sourced reward token (e.g. a manual top-up). Caller must have approved.
+    /// @dev Pull-pattern fallback for externally-sourced reward token (e.g. a manual top-up). Caller must approve.
+    ///      Credits the REAL measured delta (must-fix #5), not the nominal `amount`.
     function donateReward(uint256 amount) external nonReentrant {
         require(amount > 0, unicode"Bad amount / 金额错误");
+        uint256 balBefore = IERC20(rewardToken).balanceOf(address(this));
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), amount);
-        _notifyReward(amount);
+        uint256 received = IERC20(rewardToken).balanceOf(address(this)) - balBefore;
+        require(received > 0, unicode"No reward received / 未收到奖励");
+        _notifyReward(received);
     }
 
     function _notifyReward(uint256 amount) internal {
@@ -483,8 +674,8 @@ contract RamMiningVaultUpgradeable is
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
         schema.vaultType = "RamMiningVault";
         schema.description =
-            "Mine tokenized NVIDIA with RAM. Buy a rig with BNB to gain mining power; the vault buys tokenized NVIDIA with real trading fees and distributes it pro-rata to your power. No buyback & burn.";
-        schema.methods = new VaultMethodSchema[](6);
+            "Mine tokenized NVIDIA with RAM. Buy a rig with BNB to gain mining power; the vault acquires tokenized NVIDIA from keepers at the Chainlink oracle price plus a small clamped premium (funded by real trading fees) and distributes it pro-rata to your power. No buyback & burn.";
+        schema.methods = new VaultMethodSchema[](9);
 
         schema.methods[0].name = "getVaultMiningStats";
         schema.methods[0].description =
@@ -546,6 +737,37 @@ contract RamMiningVaultUpgradeable is
         schema.methods[5].outputs = new FieldDescriptor[](0);
         schema.methods[5].approvals = new ApproveAction[](0);
         schema.methods[5].isWriteMethod = true;
+
+        schema.methods[6].name = "quoteSellToVault";
+        schema.methods[6].description =
+            "Keeper RFQ quote: BNB the vault will pay for a given amount of reward token at the oracle price plus premium.";
+        schema.methods[6].inputs = new FieldDescriptor[](1);
+        schema.methods[6].inputs[0] = FieldDescriptor("rewardAmount", "uint256", "Reward token amount to sell", 18);
+        schema.methods[6].outputs = new FieldDescriptor[](1);
+        schema.methods[6].outputs[0] = FieldDescriptor("bnbOwed", "uint256", "BNB the vault will pay", 18);
+        schema.methods[6].approvals = new ApproveAction[](0);
+
+        schema.methods[7].name = "sellRewardToVault";
+        schema.methods[7].description =
+            "Keeper RFQ fill: sell reward token into the vault for BNB at the oracle price plus premium. Set minBnbOut for slippage protection.";
+        schema.methods[7].inputs = new FieldDescriptor[](2);
+        schema.methods[7].inputs[0] = FieldDescriptor("rewardAmount", "uint256", "Reward token amount to sell", 18);
+        schema.methods[7].inputs[1] = FieldDescriptor("minBnbOut", "uint256", "Minimum BNB to accept (slippage)", 18);
+        schema.methods[7].outputs = new FieldDescriptor[](1);
+        schema.methods[7].outputs[0] = FieldDescriptor("bnbOut", "uint256", "BNB paid to the keeper", 18);
+        schema.methods[7].approvals = new ApproveAction[](1);
+        // UI: call vault.rewardToken() then token.approve(vault, rewardAmount) before the fill.
+        schema.methods[7].approvals[0] = ApproveAction("rewardToken", "rewardAmount");
+        schema.methods[7].isWriteMethod = true;
+
+        schema.methods[8].name = "claimRewardsTo";
+        schema.methods[8].description =
+            "Claim your accumulated tokenized NVIDIA rewards to a different recipient address.";
+        schema.methods[8].inputs = new FieldDescriptor[](1);
+        schema.methods[8].inputs[0] = FieldDescriptor("to", "address", "Recipient of the claimed rewards", 0);
+        schema.methods[8].outputs = new FieldDescriptor[](0);
+        schema.methods[8].approvals = new ApproveAction[](0);
+        schema.methods[8].isWriteMethod = true;
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -562,25 +784,222 @@ contract RamMiningVaultUpgradeable is
         _unpause();
     }
 
-    function emergencyWithdrawNative(address to) external nonReentrant {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
+    /// @notice Arm the full-BNB emergency withdraw (step 1 of 2). In v2 the BNB treasury is large and permanent
+    ///         (it funds keeper RFQ), so draining 100% of it is gated behind a 7-day timelock + guardian — no
+    ///         instant rug, even by the guardian. Step 2 is `emergencyWithdrawNative` after the timelock elapses.
+    function scheduleEmergencyWithdrawNative() external onlyGuardian {
+        nativeWithdrawScheduled = true;
+        nativeWithdrawScheduledAt = block.timestamp;
+        emit EmergencyWithdrawNativeScheduled(block.timestamp + NATIVE_WITHDRAW_TIMELOCK);
+    }
+
+    function cancelEmergencyWithdrawNative() external onlyGuardian {
+        nativeWithdrawScheduled = false;
+        nativeWithdrawScheduledAt = 0;
+        emit EmergencyWithdrawNativeCancelled();
+    }
+
+    function emergencyWithdrawNative(address to) external nonReentrant onlyGuardian {
         require(to != address(0), unicode"Bad recipient / 错误接收地址");
-        require(block.timestamp >= lastEmergencyWithdraw + EMERGENCY_COOLDOWN, unicode"Cooldown / 冷却期");
-        lastEmergencyWithdraw = block.timestamp;
+        require(nativeWithdrawScheduled, unicode"Withdraw not scheduled / 未安排提取");
+        require(
+            block.timestamp >= nativeWithdrawScheduledAt + NATIVE_WITHDRAW_TIMELOCK,
+            unicode"Timelock not elapsed / 时间锁未到"
+        );
+        nativeWithdrawScheduled = false;
+        nativeWithdrawScheduledAt = 0;
         uint256 bal = address(this).balance;
         (bool ok,) = to.call{value: bal}("");
         require(ok, unicode"Native withdraw failed / 原生币提取失败");
         emit EmergencyWithdrawNative(to, bal);
     }
 
+    /// @notice Emergency BNB withdraw. NOTE: in v2 the BNB treasury is larger and permanent (it funds keeper RFQ),
+    ///         so this keeps the v1 guardian + cooldown gate. The reward token owed to miners is NOT drainable here.
     function emergencyWithdrawToken(address token, address to) external nonReentrant {
         require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
         require(to != address(0), unicode"Bad recipient / 错误接收地址");
+        // must-fix: never let the guardian drain the reward token owed to miners through the generic token sweep.
+        // The ONLY path that can move the reward token is the long-timelocked, pause-gated emergencyRescueReward.
+        require(token != rewardToken, unicode"Use emergencyRescueReward / 请用奖励救援");
         require(block.timestamp >= lastEmergencyWithdraw + EMERGENCY_COOLDOWN, unicode"Cooldown / 冷却期");
         lastEmergencyWithdraw = block.timestamp;
         uint256 bal = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransfer(to, bal);
         emit EmergencyWithdrawToken(token, to, bal);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  Keeper / oracle configuration (guardian) — safe-by-default, tunable
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// @notice Set/replace the Chainlink feeds used to price keeper RFQ fills. Both feeds MUST be 8-decimal.
+    /// @dev should-fix #9: changing feeds DISARMS the deviation band (referencePrice = 0) — the guardian must
+    ///      consciously re-arm the reference against the new feed (and re-set caps) before sells can run again.
+    function setPriceFeeds(address _rewardPriceFeed, address _bnbPriceFeed) external onlyGuardian {
+        require(_rewardPriceFeed != address(0) && _bnbPriceFeed != address(0), unicode"Bad feed / 预言机无效");
+        require(AggregatorV3Interface(_rewardPriceFeed).decimals() == 8, unicode"Reward feed not 8dec / 奖励预言机非8位");
+        require(AggregatorV3Interface(_bnbPriceFeed).decimals() == 8, unicode"BNB feed not 8dec / BNB预言机非8位");
+        rewardPriceFeed = _rewardPriceFeed;
+        bnbPriceFeed = _bnbPriceFeed;
+        referencePrice = 0; // disarm the band on a feed change (conscious re-arm required)
+        emit ReferencePriceSet(0);
+        emit KeeperConfigured(_rewardPriceFeed, _bnbPriceFeed, keeperPremiumBps);
+    }
+
+    /// @notice Arm/adjust the absolute BNB egress caps (must-fix #1b/#1c). Both default to 0 (sells disabled).
+    /// @dev blocker #4b: enabling sells (either cap > 0) REQUIRES the deviation band to be armed first
+    ///      (referencePrice != 0), so the guardian can never open egress with a blind/unarmed oracle band.
+    function setKeeperLimits(uint256 _maxBnbOutPerFill, uint256 _maxBnbOutPerWindow) external onlyGuardian {
+        if (_maxBnbOutPerFill > 0 || _maxBnbOutPerWindow > 0) {
+            require(referencePrice != 0, unicode"Arm reference price first / 请先设定参考价");
+        }
+        maxBnbOutPerFill = _maxBnbOutPerFill;
+        maxBnbOutPerWindow = _maxBnbOutPerWindow;
+        emit KeeperLimitsSet(_maxBnbOutPerFill, _maxBnbOutPerWindow);
+    }
+
+    /// @notice Tune the deviation band width and per-feed staleness windows (must-fix #2).
+    function setOracleGuards(uint256 _priceDeviationBps, uint256 _bnbFeedMaxStale, uint256 _rewardFeedMaxStale)
+        external
+        onlyGuardian
+    {
+        require(_priceDeviationBps <= BPS_DENOM, unicode"Bad deviation / 偏差无效");
+        require(_bnbFeedMaxStale > 0 && _rewardFeedMaxStale > 0, unicode"Bad staleness / 过期阈值无效");
+        priceDeviationBps = _priceDeviationBps;
+        bnbFeedMaxStale = _bnbFeedMaxStale;
+        rewardFeedMaxStale = _rewardFeedMaxStale;
+        emit OracleGuardsSet(_priceDeviationBps, _bnbFeedMaxStale, _rewardFeedMaxStale);
+    }
+
+    /// @notice Arm/move the NVDA/USD reference price for the deviation band. Must be a fresh, live value
+    ///         (validated against the feed) to keep the band meaningful; passing 0 disables the band.
+    function setReferencePrice(uint256 newReference) external onlyGuardian {
+        if (newReference != 0) {
+            uint256 live = _readFeed(rewardPriceFeed, rewardFeedMaxStale);
+            uint256 diff = newReference > live ? newReference - live : live - newReference;
+            // The armed reference must itself be within the band of the live feed (no arbitrarily-wide reference).
+            require(diff * BPS_DENOM <= live * priceDeviationBps, unicode"Reference off-market / 参考价偏离");
+        }
+        referencePrice = newReference;
+        emit ReferencePriceSet(newReference);
+    }
+
+    /// @notice Guardian sets the keeper premium directly, clamped to [MIN_PREMIUM_BPS, MAX_PREMIUM_BPS].
+    function setKeeperPremium(uint256 bps) external onlyGuardian {
+        require(bps >= MIN_PREMIUM_BPS && bps <= MAX_PREMIUM_BPS, unicode"Premium out of range / 溢价超范围");
+        keeperPremiumBps = bps;
+        emit KeeperPremiumSet(bps);
+    }
+
+    /// @notice Guardian emergency pause/resume of keeper acquisition (immediate). Gates sellRewardToVault ONLY;
+    ///         claims always remain open. The AI agent can also pause via lever 4, but only behind a timelock.
+    function pauseAcquisition() external onlyGuardian {
+        acquisitionPaused = true;
+        emit AcquisitionPausedSet(true);
+    }
+
+    function resumeAcquisition() external onlyGuardian {
+        acquisitionPaused = false;
+        emit AcquisitionPausedSet(false);
+    }
+
+    /// @notice Wire the on-chain pause oracle for the reward token. REQUIRED before the emergency rescue can be
+    ///         armed or executed: both `scheduleEmergencyRescue` and `emergencyRescueReward` verify the reward
+    ///         token is actually paused via this oracle (blocker #3).
+    /// @dev SET-ONCE (blocker #3 hardening): a guardian could otherwise wire a spoofed always-true IPauseManager
+    ///      and drain the reward. The oracle can be set exactly once; changing it afterwards requires a beacon
+    ///      upgrade (itself behind the factory's 2-day timelock + guardian).
+    function setPauseManager(address _pauseManager) external onlyGuardian {
+        require(pauseManager == address(0), unicode"Pause oracle already set / 暂停预言机已设置");
+        require(_pauseManager != address(0), unicode"Bad pause oracle / 暂停预言机无效");
+        pauseManager = _pauseManager;
+        emit PauseManagerSet(_pauseManager);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  Emergency reward rescue (must-fix #3) — worst-case permanent NVDAB pause
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    //  This is NOT a free drain. It is a last-resort hatch for the catastrophic case where the regulated reward
+    //  token (NVDAB) is paused/blocked for the vault so that NO miner can ever claim again. It is gated by:
+    //    (a) the guardian, (b) a 30-day timelock (schedule → wait → execute), and (c) a MANDATORY on-chain pause
+    //    condition: a (set-once) pauseManager MUST be wired and must report the token paused BOTH at schedule time
+    //    AND again at execute time. If the pause was lifted during the timelock, execute CONSUMES the schedule
+    //    WITHOUT transferring (no revert) — so a later transient re-pause cannot drain on the old elapsed timelock;
+    //    a fresh schedule + a new 30-day wait is required.
+    //
+    //  HONEST LIMITATION: NVDAB's pause lives in a separate compliance manager (per Flap Q2/Q4), so the token can
+    //  be "paused" per the oracle while specific transfers (e.g. to a fresh compliant recovery address) still
+    //  succeed — that is exactly the recoverable case this hatch serves. If, instead, the token GLOBALLY refuses
+    //  ALL transfers, the rescue `safeTransfer` itself reverts: nothing on-chain can move a token that blocks every
+    //  transfer, and that permanent global halt is an inherent, unrecoverable property of the asset.
+
+    function scheduleEmergencyRescue() external onlyGuardian {
+        // blocker #3: the rescue may only be ARMED through a real, on-chain-verifiable pause. A pause oracle MUST
+        // be wired, and it must report the reward token as paused right now — no arming "just in case".
+        require(pauseManager != address(0), unicode"Pause oracle not set / 未设置暂停预言机");
+        require(IPauseManager(pauseManager).isTokenPaused(rewardToken), unicode"Reward not paused / 奖励未暂停");
+        rescueScheduled = true;
+        rescueScheduledAt = block.timestamp;
+        emit EmergencyRescueScheduled(block.timestamp + RESCUE_TIMELOCK);
+    }
+
+    function cancelEmergencyRescue() external onlyGuardian {
+        rescueScheduled = false;
+        rescueScheduledAt = 0;
+        emit EmergencyRescueCancelled();
+    }
+
+    function emergencyRescueReward(address to) external nonReentrant onlyGuardian {
+        require(to != address(0), unicode"Bad recipient / 错误接收地址");
+        require(rescueScheduled, unicode"Rescue not scheduled / 未安排救援");
+        require(block.timestamp >= rescueScheduledAt + RESCUE_TIMELOCK, unicode"Timelock not elapsed / 时间锁未到");
+        require(pauseManager != address(0), unicode"Pause oracle not set / 未设置暂停预言机");
+        // blocker #3: RE-CHECK the pause at execution time. If the pause was lifted at any point during the
+        // 30-day timelock, the reward is no longer trapped → CONSUME the schedule WITHOUT transferring. This
+        // forces a fresh schedule + a new 30-day wait, so a transient 1-block re-pause can't drain on the stale
+        // elapsed timelock.
+        if (!IPauseManager(pauseManager).isTokenPaused(rewardToken)) {
+            rescueScheduled = false;
+            rescueScheduledAt = 0;
+            emit EmergencyRescueCancelled();
+            return;
+        }
+        rescueScheduled = false;
+        rescueScheduledAt = 0;
+        uint256 bal = IERC20(rewardToken).balanceOf(address(this));
+        IERC20(rewardToken).safeTransfer(to, bal);
+        emit EmergencyRescueExecuted(to, bal);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    //  Keeper views
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// @notice Snapshot of keeper-relevant state for ops/keepers/UI.
+    function getKeeperStats()
+        external
+        view
+        returns (
+            uint256 premiumBps,
+            uint256 perFillCap,
+            uint256 perWindowCap,
+            uint256 windowUsed,
+            uint256 windowResetsAt,
+            uint256 refPrice,
+            uint256 lastFillAt,
+            bool paused
+        )
+    {
+        premiumBps = keeperPremiumBps;
+        perFillCap = maxBnbOutPerFill;
+        perWindowCap = maxBnbOutPerWindow;
+        windowUsed = block.timestamp >= windowStart + WINDOW ? 0 : bnbOutThisWindow;
+        windowResetsAt = windowStart + WINDOW;
+        refPrice = referencePrice;
+        lastFillAt = lastFillTimestamp;
+        paused = acquisitionPaused;
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -594,17 +1013,14 @@ contract RamMiningVaultUpgradeable is
         address _trigger,
         uint256 _modelId,
         uint256 _reasonFee,
-        uint64 _epochInterval,
-        uint256 _dcaBps
+        uint64 _epochInterval
     ) external {
         require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
-        require(_dcaBps >= MIN_DCA_BPS && _dcaBps <= MAX_DCA_BPS, unicode"Bad DCA bps / DCA 比例错误");
         flapAIProvider = _provider;
         flapTriggerService = _trigger;
         aiModelId = _modelId;
         aiReasonFee = _reasonFee;
         epochInterval = _epochInterval;
-        dcaPercentBps = _dcaBps;
         emit AgentConfigured(_provider, _trigger, _modelId);
     }
 
@@ -671,8 +1087,9 @@ contract RamMiningVaultUpgradeable is
         require(block.timestamp >= queuedReadyAt, unicode"Timelock not elapsed / 时间锁未到");
         uint8 lever = queuedLever;
         hasQueuedAction = false;
-        if (lever == 5) {
-            _pause(); // freno: pause rig sales
+        if (lever == 4) {
+            acquisitionPaused = true; // freno: pause keeper acquisition (claims stay open)
+            emit AcquisitionPausedSet(true);
         }
         emit QueuedActionExecuted(lever);
     }
@@ -702,38 +1119,35 @@ contract RamMiningVaultUpgradeable is
             IFlapTriggerService(flapTriggerService).requestTrigger{value: fee}(uint64(block.timestamp + epochInterval));
     }
 
-    /// @dev Applies the chosen lever. Low-risk/reversible levers execute immediately (tiered autonomy);
-    ///      the high-impact lever (5 = pause sales) is queued behind a timelock for guardian execution.
+    /// @dev Applies the chosen lever. Low-risk/reversible premium levers execute immediately (tiered autonomy);
+    ///      the high-impact lever (4 = pause acquisition) is queued behind a timelock for guardian execution.
+    ///      The premium only ever moves IN FAVOUR of miners and is clamped to [MIN_PREMIUM_BPS, MAX_PREMIUM_BPS].
     ///      NO burn lever exists.
     function _applyLever(uint8 choice) internal {
-        if (choice == 0 || choice == 2) {
-            return; // 0 HOLD · 2 RETAIN reserve (no-op)
+        if (choice == 0 || choice == 3) {
+            return; // 0 HOLD · 3 RETAIN reserve (no-op)
         } else if (choice == 1) {
-            // DCA: buy NVDA with a clamped slice of the BNB reserve (auto, cooldown-gated)
-            if (block.timestamp < dcaCooldownUntil) return;
-            uint256 amt = (address(this).balance * dcaPercentBps) / 10000;
-            if (amt == 0) return;
-            dcaCooldownUntil = block.timestamp + DCA_COOLDOWN;
-            // B1 fix (anti-MEV): derive an on-chain min-out from the router quote with a clamped slippage bound,
-            // instead of accepting amountOutMin=0. If liquidity can't satisfy the bound the swap reverts (safe).
-            _deployToReward(amt, _dcaMinOut(amt));
-        } else if (choice == 3) {
-            uint256 next = dcaPercentBps + DCA_STEP_BPS;
-            dcaPercentBps = next > MAX_DCA_BPS ? MAX_DCA_BPS : next;
+            // RAISE_PREMIUM: more attractive to keepers (faster conversion of accumulated BNB), clamp to MAX.
+            uint256 next = keeperPremiumBps + PREMIUM_STEP_BPS;
+            keeperPremiumBps = next > MAX_PREMIUM_BPS ? MAX_PREMIUM_BPS : next;
+            emit KeeperPremiumSet(keeperPremiumBps);
+        } else if (choice == 2) {
+            // LOWER_PREMIUM: more value retained for miners (slower conversion), clamp to MIN (never < 100%).
+            uint256 cur = keeperPremiumBps;
+            keeperPremiumBps = cur > MIN_PREMIUM_BPS + PREMIUM_STEP_BPS ? cur - PREMIUM_STEP_BPS : MIN_PREMIUM_BPS;
+            emit KeeperPremiumSet(keeperPremiumBps);
         } else if (choice == 4) {
-            dcaPercentBps = dcaPercentBps < MIN_DCA_BPS + DCA_STEP_BPS ? MIN_DCA_BPS : dcaPercentBps - DCA_STEP_BPS;
-        } else if (choice == 5) {
-            // HIGH IMPACT: queue pause-sales behind a timelock (guardian executes)
-            queuedLever = 5;
+            // HIGH IMPACT: queue pause-acquisition behind a timelock (guardian executes). Claims stay open.
+            queuedLever = 4;
             queuedReadyAt = block.timestamp + ACTION_TIMELOCK;
             hasQueuedAction = true;
-            emit QueuedActionScheduled(5, queuedReadyAt);
+            emit QueuedActionScheduled(4, queuedReadyAt);
         }
     }
 
     function _buildPrompt() internal pure returns (string memory) {
         return
-        "You are the RAM vault economic agent for a real-yield mining vault that buys tokenized NVIDIA with real trading fees and shares it by mining power. Choose ONE lever (reply with the integer 0-5). NO token burns. 0=HOLD; 1=DCA buy NVDA with a clamped slice of the BNB reserve; 2=retain/grow BNB reserve; 3=raise DCA aggressiveness; 4=lower DCA aggressiveness; 5=pause rig sales (emergency brake). Use the ave_token_info tool for market data before deciding.";
+        "You are the RAM vault economic agent for a real-yield mining vault. The vault holds BNB from real trading fees and acquires tokenized NVIDIA (NVDAB) from permissionless keepers at the Chainlink oracle price plus a small clamped premium, then shares it by mining power. You regulate ONLY the keeper premium (and an emergency pause). Choose ONE lever (reply with the integer 0-4). NO token burns. 0=HOLD; 1=RAISE_PREMIUM (more keepers, faster conversion of BNB into NVDA, costs miners a little); 2=LOWER_PREMIUM (more value to miners, slower conversion); 3=RETAIN reserve; 4=PAUSE_ACQUISITION (emergency brake, timelocked). The premium is clamped to 100%-103% and only ever favours miners. Consider the recent fill-rate (lastFillTimestamp) and BNB reserve before deciding. Use the ave_token_info tool for market data first.";
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -778,22 +1192,22 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
         beacon = address(new UpgradeableBeacon(address(impl)));
     }
 
-    /// @dev vaultData = abi.encode(rewardToken, swapRouter, basePriceWei, seasonEnd).
+    /// @dev vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd).
     function newVault(address taxToken, address, address, bytes calldata vaultData)
         external
         override
         returns (address vault)
     {
         require(msg.sender == _getVaultPortal(), unicode"Only VaultPortal / 仅限 VaultPortal 调用");
-        (address rewardToken, address swapRouter, uint256 basePriceWei, uint256 seasonEnd) =
-            abi.decode(vaultData, (address, address, uint256, uint256));
+        (address rewardToken, address rewardPriceFeed, address bnbPriceFeed, uint256 basePriceWei, uint256 seasonEnd) =
+            abi.decode(vaultData, (address, address, address, uint256, uint256));
 
         vault = address(
             new BeaconProxy(
                 beacon,
                 abi.encodeCall(
                     RamMiningVaultUpgradeable.initialize,
-                    (taxToken, rewardToken, swapRouter, basePriceWei, seasonEnd)
+                    (taxToken, rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd)
                 )
             )
         );
@@ -859,12 +1273,13 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
 
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
         schema.description =
-            "Launch a RAM Mining Vault. Users buy BNB rig contracts to earn tokenized NVIDIA bought with the RAM token's real trading fees, shared by mining power. Provide the reward token (e.g. NVDAx), the swap router, the Micro rig base price, and the season end.";
-        schema.fields = new FieldDescriptor[](4);
-        schema.fields[0] = FieldDescriptor("rewardToken", "address", "Tokenized NVIDIA reward token (e.g. NVDAx)", 0);
-        schema.fields[1] = FieldDescriptor("swapRouter", "address", "PancakeSwap router for BNB->reward swaps", 0);
-        schema.fields[2] = FieldDescriptor("basePriceWei", "uint256", "Base price for Micro Rig in BNB", 18);
-        schema.fields[3] = FieldDescriptor("seasonEnd", "time", "Mining season end timestamp", 0);
+            "Launch a RAM Mining Vault. Users buy BNB rig contracts to earn tokenized NVIDIA, acquired from keepers at the Chainlink oracle price plus a small clamped premium and funded by the RAM token's real trading fees, shared by mining power. Provide the reward token (NVDAB), the NVDA/USD and BNB/USD Chainlink feeds, the Micro rig base price, and the season end.";
+        schema.fields = new FieldDescriptor[](5);
+        schema.fields[0] = FieldDescriptor("rewardToken", "address", "Tokenized NVIDIA reward token (NVDAB)", 0);
+        schema.fields[1] = FieldDescriptor("rewardPriceFeed", "address", "Chainlink NVDA/USD price feed (8 dec)", 0);
+        schema.fields[2] = FieldDescriptor("bnbPriceFeed", "address", "Chainlink BNB/USD price feed (8 dec)", 0);
+        schema.fields[3] = FieldDescriptor("basePriceWei", "uint256", "Base price for Micro Rig in BNB", 18);
+        schema.fields[4] = FieldDescriptor("seasonEnd", "time", "Mining season end timestamp", 0);
         schema.isArray = false;
     }
 }
