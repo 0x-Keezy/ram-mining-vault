@@ -1020,16 +1020,15 @@ contract RamMiningVaultUpgradeable is
         view
         returns (uint256 priceWei, uint256 power, uint256 durationSeconds, string memory name)
     {
+        require(planId < PLAN_COUNT, unicode"Invalid plan / 无效套餐");
         if (planId == 0) {
             (priceWei, power, durationSeconds, name) = (basePriceWei, 10, 1 days, "Micro Rig");
         } else if (planId == 1) {
             (priceWei, power, durationSeconds, name) = (basePriceWei * 3, 40, 7 days, "Core Rig");
         } else if (planId == 2) {
             (priceWei, power, durationSeconds, name) = (basePriceWei * 8, 130, 30 days, "Mega Rig");
-        } else if (planId == 3) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 20, 420, 90 days, "Hyper Rig");
         } else {
-            revert(unicode"Invalid plan / 无效套餐");
+            (priceWei, power, durationSeconds, name) = (basePriceWei * 20, 420, 90 days, "Hyper Rig");
         }
         require(priceWei > 0 && power > 0 && durationSeconds > 0, unicode"Bad plan params / 套餐参数错误");
     }

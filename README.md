@@ -15,7 +15,15 @@ vault, used to acquire **tokenized NVIDIA (NVDAB)**, and distributed to "miners"
 ## Mechanism (reference for review)
 
 - **Reward engine.** A MasterChef-style accumulator (`accRewardPerPower`) splits a variable,
-  asynchronously-funded reward pool fairly by each miner's power. No inflation, no emission.
+  asynchronously-funded reward pool **pro-rata by each miner's power**. No inflation, no emission.
+- **Tier economics (disclosure).** The four rig tiers (Micro/Core/Mega/Hyper) reward capital **and
+  duration commitment**: longer / larger tiers earn proportionally more reward per BNB than the entry
+  tier (their `power × active-duration` per BNB is higher), so the tiers are **not equal on a
+  yield-per-BNB basis** — this is intentional, not a fairness guarantee across tiers. Every tier's
+  terms (power, duration, price) are public up-front via `getPlan`. A rig's mining end is capped at
+  `seasonEnd`, so a long tier bought mid-season earns only until the season ends. Post-RAM-launch
+  (Phase 2), subsequent rigs/upgrades are paid in RAM (USD-priced), which rebalances scaling
+  incentives and introduces RAM's utility sink.
 - **Acquisition — keeper / RFQ (the standard Flap interface).** Tax fees arrive as BNB and accumulate in
   the vault. Instead of swapping on a DEX, the vault acquires NVDAB through a **permissionless keeper
   RFQ**: a keeper sells NVDAB **into** the vault and is paid BNB at the **Chainlink oracle price + a
