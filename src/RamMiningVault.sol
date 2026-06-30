@@ -299,6 +299,11 @@ contract RamMiningVaultUpgradeable is
 
     /// @notice Claim accumulated rewards to a different recipient — useful if the caller's own address became
     ///         non-compliant for the (regulated) reward token but a fresh recipient can still receive it.
+    /// @dev Flap pre-audit #4: the open `to` parameter is BY DESIGN and is NOT an access-control gap. The caller
+    ///      (`msg.sender`) can only ever settle and claim THEIR OWN rigs (`_claim(msg.sender, to)` reads
+    ///      `userRigs[msg.sender]`); `to` is purely the payout recipient. No caller can ever claim, redirect, or
+    ///      touch another miner's rewards. The only effect of an open `to` is letting a compliance-blocked owner
+    ///      route their own NVDAB to a fresh compliant address.
     function claimRewardsTo(address to) external nonReentrant returns (uint256 amount) {
         require(to != address(0), unicode"Bad recipient / 错误接收地址");
         amount = _claim(msg.sender, to);
@@ -467,6 +472,11 @@ contract RamMiningVaultUpgradeable is
     /// @notice Credit reward tokens already held/received by the vault into the distribution accumulator.
     /// @dev Pull-pattern fallback for externally-sourced reward token (e.g. a manual top-up). Caller must approve.
     ///      Credits the REAL measured delta (must-fix #5), not the nominal `amount`.
+    /// @dev Flap pre-audit #3: PERMISSIONLESS by design (intended use: manual top-ups by the team / any benefactor).
+    ///      There is no economic attack surface: it is value-IN only — the donor transfers reward token to the vault
+    ///      and it is credited pro-rata to ACTIVE miners via the shared `accRewardPerPower` accumulator (or buffered in
+    ///      `rewardUndistributed` when no power is active). A donor can never extract value, dilute, or redirect any
+    ///      miner's reward; the worst a caller can do is gift tokens to the existing miners.
     function donateReward(uint256 amount) external nonReentrant {
         require(amount > 0, unicode"Bad amount / 金额错误");
         uint256 balBefore = IERC20(rewardToken).balanceOf(address(this));
@@ -827,6 +837,20 @@ contract RamMiningVaultUpgradeable is
         }
         referencePrice = newReference;
         emit ReferencePriceSet(newReference);
+    }
+
+    /// @notice Atomically disarm keeper sells: zero BOTH BNB egress caps AND the deviation-band reference in one call.
+    /// @dev Flap pre-audit #2: removes any operational window in which `referencePrice == 0` while the egress caps
+    ///      remain armed. Sells already FAIL-CLOSED in that window (`_checkDeviationBand` reverts when the band is
+    ///      disarmed but either cap is still non-zero), so this is a clarity/ergonomics hardening, not a new safety
+    ///      property: it gives the guardian (and the auditor) a single, atomic "stop sells" switch instead of a
+    ///      two-call sequence. Re-arming is deliberate: setReferencePrice(...) then setKeeperLimits(...).
+    function disarmSells() external onlyGuardian {
+        maxBnbOutPerFill = 0;
+        maxBnbOutPerWindow = 0;
+        referencePrice = 0;
+        emit KeeperLimitsSet(0, 0);
+        emit ReferencePriceSet(0);
     }
 
     /// @notice Guardian sets the keeper premium directly, clamped to [MIN_PREMIUM_BPS, MAX_PREMIUM_BPS].

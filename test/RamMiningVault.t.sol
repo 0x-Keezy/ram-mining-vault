@@ -509,6 +509,41 @@ contract RamMiningVaultTest is Test {
         assertEq(vault.totalBnbPaidToKeepers(), 2 * quoted, "tumbling window allows ~2x at the boundary");
     }
 
+    /// @dev Flap pre-audit #2: disarmSells() atomically zeros BOTH egress caps AND the deviation reference in one
+    ///      call, and a subsequent keeper sell fails-closed. Removes the "referencePrice==0 while caps armed" window.
+    function testDisarmSellsAtomicAndFailsClosed() public {
+        _buy(alice, 1); // Core rig
+        vm.deal(address(vault), 10 ether);
+        _armKeeperWithLimits(100 ether, 100 ether);
+
+        // sells work while armed
+        _freshFeeds();
+        uint256 paid = _sell(1e18, 0);
+        assertGt(paid, 0, "armed sell should pay BNB");
+
+        // guardian disarms in ONE atomic call
+        vm.prank(GUARDIAN);
+        vault.disarmSells();
+        assertEq(vault.maxBnbOutPerFill(), 0, "per-fill cap zeroed");
+        assertEq(vault.maxBnbOutPerWindow(), 0, "per-window cap zeroed");
+        assertEq(vault.referencePrice(), 0, "reference disarmed");
+
+        // a subsequent sell fails-closed (per-fill cap == 0)
+        _freshFeeds();
+        reward.mint(keeper, 1e18);
+        vm.startPrank(keeper);
+        reward.approve(address(vault), 1e18);
+        vm.expectRevert(bytes(unicode"Over per-fill cap / 超过单次上限"));
+        vault.sellRWAToVault(1e18, 0);
+        vm.stopPrank();
+    }
+
+    /// @dev disarmSells() is guardian-only.
+    function testDisarmSellsOnlyGuardian() public {
+        vm.expectRevert();
+        vault.disarmSells();
+    }
+
     function testSellDeviationBandReverts() public {
         _buy(alice, 0);
         _armKeeper();
