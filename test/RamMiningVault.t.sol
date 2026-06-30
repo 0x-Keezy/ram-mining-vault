@@ -262,6 +262,21 @@ contract RamMiningVaultTest is Test {
         assertFalse(factory.isQuoteTokenSupported(RAM_TOKEN));
     }
 
+    /// Rule 002 / reference test: newVault must revert for any caller other than the VaultPortal.
+    function testFactoryRejectsNonVaultPortalCaller() public {
+        bytes memory vd = abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
+        vm.expectRevert(bytes(unicode"Only VaultPortal / 仅限 VaultPortal 调用"));
+        factory.newVault(RAM_TOKEN, address(0), address(this), vd); // not pranked as the portal
+    }
+
+    /// description() must reflect state (no rigs yet → mining), per the integration-test guide.
+    function testDescriptionChangesWithState() public {
+        string memory before = vault.description();
+        _buy(alice, 0);
+        string memory after_ = vault.description();
+        assertTrue(keccak256(bytes(before)) != keccak256(bytes(after_)), "description() should change with state");
+    }
+
     function testVaultSchema() public view {
         VaultUISchema memory ui = vault.vaultUISchema();
         assertEq(ui.vaultType, "RamMiningVault");
@@ -469,13 +484,38 @@ contract RamMiningVaultTest is Test {
         assertEq(owed, quoted);
     }
 
+    /// Documents the FIXED/TUMBLING window boundary: ~2x maxBnbOutPerWindow can egress straddling a boundary
+    /// (full cap just before the reset + full cap just after). NOT a drain (value-for-value), but the guardian
+    /// must size maxBnbOutPerWindow accordingly. See _consumeWindow.
+    function testWindowBoundaryAllowsDoubleEgressBurst() public {
+        _buy(alice, 1); // Core rig (7 days) survives the warp
+        _armReference();
+        vm.deal(address(vault), 10 ether);
+        uint256 quoted = vault.quoteRWAToVault(1e18);
+        vm.prank(GUARDIAN);
+        vault.setKeeperLimits(quoted * 2, quoted); // per-window cap = exactly one 1e18 fill
+
+        // fill the full cap at the LAST instant of the current window
+        vm.warp(vault.windowStart() + vault.WINDOW() - 1);
+        _freshFeeds();
+        _sell(1e18, 0);
+
+        // cross the boundary by 1 second → tumbling reset grants a FRESH full cap → second full fill ~1s later
+        vm.warp(block.timestamp + 1);
+        _freshFeeds();
+        _sell(1e18, 0);
+
+        // ~2x the nominal per-window cap egressed within ~1 second — the documented boundary burst
+        assertEq(vault.totalBnbPaidToKeepers(), 2 * quoted, "tumbling window allows ~2x at the boundary");
+    }
+
     function testSellDeviationBandReverts() public {
         _buy(alice, 0);
         _armKeeper();
         _freshFeeds();
         vm.deal(address(vault), 10 ether);
 
-        // arm the band at the current price, then move the feed > 2% away
+        // arm the band at the current price, then move the feed > 5% away (default band)
         vm.prank(GUARDIAN);
         vault.setReferencePrice(uint256(NVDA_USD));
         nvdaFeed.setAnswer(140e8); // +7.7% vs reference 130
@@ -496,7 +536,7 @@ contract RamMiningVaultTest is Test {
 
         vm.prank(GUARDIAN);
         vault.setReferencePrice(uint256(NVDA_USD));
-        nvdaFeed.setAnswer(131e8); // +0.77% within the 2% band
+        nvdaFeed.setAnswer(131e8); // +0.77% within the 5% band
 
         uint256 owed = _sell(1e18, 0);
         assertGt(owed, 0);

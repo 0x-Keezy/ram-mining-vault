@@ -73,6 +73,7 @@ contract RamMiningVaultForkTest is Test {
         string memory rpc = vm.envOr("BNB_RPC_URL", string(""));
         if (bytes(rpc).length == 0) {
             emit log("SKIP: set BNB_RPC_URL to run the real-NVDAB keeper fork test");
+            vm.skip(true); // report as SKIPPED (not PASSED) so the suite count is honest without an RPC
             return;
         }
         address nvda = vm.envOr("NVDAX_ADDRESS", NVDAB);

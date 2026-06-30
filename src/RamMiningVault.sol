@@ -78,7 +78,7 @@ contract RamMiningVaultUpgradeable is
     uint256 public constant MAX_BNB_FEED_STALE = 1 days;
 
     // --- keeper egress safety ---
-    uint256 public constant WINDOW = 1 days; // rolling rate-limit window for BNB egress
+    uint256 public constant WINDOW = 1 days; // fixed/tumbling rate-limit window for BNB egress (see _consumeWindow)
 
     // --- config (set at initialize) ---
     address public taxToken; // RAM token (fee source; not held by this vault directly)
@@ -217,7 +217,13 @@ contract RamMiningVaultUpgradeable is
         // trade-off until Flap's 24/7 NVDA feed is wired (then the guardian can tighten this toward ~12–24h). The
         // hard dead-feed wall stays at MAX_REWARD_FEED_STALE (30d): a genuinely dead feed still makes sells revert.
         rewardFeedMaxStale = 7 days;
-        priceDeviationBps = 200; // ±2% band vs referencePrice once armed
+        // ±5% band vs the armed referencePrice. NVDA is a volatile single stock that routinely moves >2% intraday,
+        // and the band compares the live feed against a STATIC guardian-armed reference — so a too-tight band would
+        // brick ALL keeper fills on a legitimate price move until the guardian re-arms (fails CLOSED: no fund loss,
+        // but a liveness footgun). 5% matches Flap's 24/7 feed deviation threshold. GUARDIAN DUTY: keep the band wide
+        // enough for NVDA's real volatility and re-arm `setReferencePrice` periodically so the band stays meaningful
+        // (its job is to catch a manipulated/jumped oracle, not normal drift; tighten once the 24/7 feed is wired).
+        priceDeviationBps = 500; // ±5% band vs referencePrice once armed (NVDA-appropriate default)
         windowStart = block.timestamp;
         // maxBnbOutPerFill, maxBnbOutPerWindow, referencePrice default to 0 (sells disabled / band off until armed).
     }
@@ -376,7 +382,7 @@ contract RamMiningVaultUpgradeable is
 
         // must-fix #1a: deviation band vs the armed reference price (rejects an oracle that jumped/was manipulated).
         _checkDeviationBand();
-        // must-fix #1c: rolling per-window BNB egress rate-limit.
+        // must-fix #1c: per-window BNB egress rate-limit (fixed/tumbling window — see _consumeWindow).
         _consumeWindow(bnbOwed);
 
         require(address(this).balance >= bnbOwed, unicode"Insufficient BNB / BNB 不足");
@@ -442,7 +448,13 @@ contract RamMiningVaultUpgradeable is
         require(diff * BPS_DENOM <= ref * priceDeviationBps, unicode"Price out of band / 价格超出区间");
     }
 
-    /// @dev must-fix #1c: rolling-window BNB egress accounting; reverts if this fill would breach the window cap.
+    /// @dev must-fix #1c: per-window BNB egress accounting; reverts if this fill would breach the window cap.
+    ///      NOTE: this is a FIXED / TUMBLING window (NOT a sliding window) — the counter resets the first time a
+    ///      fill lands at/after windowStart + WINDOW, anchoring a fresh full allowance to that fill. A keeper can
+    ///      therefore egress up to ~2× maxBnbOutPerWindow straddling a boundary (full cap just before the reset +
+    ///      full cap just after). This is NOT a drain (every fill is value-for-value: NVDA in at oracle price, BNB
+    ///      out at the clamped premium), but the guardian must SIZE maxBnbOutPerWindow knowing the worst-case
+    ///      boundary egress is ~2× the nominal per-window figure.
     function _consumeWindow(uint256 amount) internal {
         if (block.timestamp >= windowStart + WINDOW) {
             windowStart = block.timestamp;
