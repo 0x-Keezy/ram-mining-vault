@@ -184,16 +184,16 @@ contract RamMiningVaultUpgradeable is
         uint256 _seasonEnd
     ) external initializer {
         __ReentrancyGuard_init();
-        require(_taxToken != address(0), unicode"RAM token required / 需要 RAM 代币地址");
-        require(_rewardToken != address(0), unicode"Reward token required / 需要奖励代币地址");
-        require(_rewardPriceFeed != address(0), unicode"Reward feed required / 需要奖励价格预言机");
-        require(_bnbPriceFeed != address(0), unicode"BNB feed required / 需要 BNB 价格预言机");
+        require(_taxToken != address(0), "RAM token required");
+        require(_rewardToken != address(0), "Reward token required");
+        require(_rewardPriceFeed != address(0), "Reward feed required");
+        require(_bnbPriceFeed != address(0), "BNB feed required");
         // should-fix #7: the quote math assumes 8-decimal Chainlink feeds (the two feeds cancel). Enforce it so a
         // mis-wired feed with different decimals can never silently mis-price the keeper payout.
-        require(AggregatorV3Interface(_rewardPriceFeed).decimals() == 8, unicode"Reward feed not 8dec / 奖励预言机非8位");
-        require(AggregatorV3Interface(_bnbPriceFeed).decimals() == 8, unicode"BNB feed not 8dec / BNB预言机非8位");
-        require(_basePriceWei > 0, unicode"Base price required / 需要基础价格");
-        require(_seasonEnd >= block.timestamp + 1 days, unicode"Season too short / 赛季过短");
+        require(AggregatorV3Interface(_rewardPriceFeed).decimals() == 8, "Reward feed not 8dec");
+        require(AggregatorV3Interface(_bnbPriceFeed).decimals() == 8, "BNB feed not 8dec");
+        require(_basePriceWei > 0, "Base price required");
+        require(_seasonEnd >= block.timestamp + 1 days, "Season too short");
 
         taxToken = _taxToken;
         rewardToken = _rewardToken;
@@ -237,35 +237,35 @@ contract RamMiningVaultUpgradeable is
     // ──────────────────────────────────────────────────────────────────────────
 
     function buyMiningContract(uint256 planId) external payable nonReentrant {
-        require(planId < PLAN_COUNT, unicode"Invalid plan / 无效套餐");
-        require(block.timestamp < seasonEnd, unicode"Mining season ended / 挖矿赛季已结束");
+        require(planId < PLAN_COUNT, "Invalid plan");
+        require(block.timestamp < seasonEnd, "Mining season ended");
 
         _settleExpiries();
         _compact(msg.sender);
-        require(userRigs[msg.sender].length < MAX_CONTRACTS_PER_USER, unicode"Too many rigs / 矿机数量过多");
+        require(userRigs[msg.sender].length < MAX_CONTRACTS_PER_USER, "Too many rigs");
 
         (uint256 priceWei, uint256 power, uint256 duration,) = _plan(planId);
-        require(msg.value >= priceWei, unicode"Not enough BNB / BNB 不足");
+        require(msg.value >= priceWei, "Not enough BNB");
 
         uint256 start = block.timestamp;
         uint256 end = start + duration;
         if (end > seasonEnd) {
             end = seasonEnd;
         }
-        require(end > start, unicode"No mining time left / 没有剩余挖矿时间");
+        require(end > start, "No mining time left");
         uint256 endBucket = end / BUCKET;
         // BUG FIX (last-bucket brick): _settleExpiries() above advanced lastSettledBucket to nowBucket and the
         // settle loop only scans buckets > lastSettledBucket. A rig whose endBucket has already been settled
         // (e.g. near seasonEnd, when end is capped into the current/settled bucket) would inflate totalActivePower
         // forever (its power never gets subtracted) and read accSnapshotAtBucket==0 → owed underflow → claims
         // brick for everyone. Reject such rigs: their power must expire in a future, not-yet-settled bucket.
-        require(endBucket > lastSettledBucket, unicode"Rig ends too soon / 套餐过短");
+        require(endBucket > lastSettledBucket, "Rig ends too soon");
 
         // Refund excess BNB before recording state (safe-order; full revert on failure).
         uint256 refund = msg.value - priceWei;
         if (refund > 0) {
             (bool ok,) = msg.sender.call{value: refund}("");
-            require(ok, unicode"Refund failed / 退款失败");
+            require(ok, "Refund failed");
         }
 
         lastContractId += 1;
@@ -305,7 +305,7 @@ contract RamMiningVaultUpgradeable is
     ///      touch another miner's rewards. The only effect of an open `to` is letting a compliance-blocked owner
     ///      route their own NVDAB to a fresh compliant address.
     function claimRewardsTo(address to) external nonReentrant returns (uint256 amount) {
-        require(to != address(0), unicode"Bad recipient / 错误接收地址");
+        require(to != address(0), "Bad recipient");
         amount = _claim(msg.sender, to);
     }
 
@@ -326,7 +326,7 @@ contract RamMiningVaultUpgradeable is
                 amount += owed;
             }
         }
-        require(amount > 0, unicode"Nothing to claim / 无可领取");
+        require(amount > 0, "Nothing to claim");
 
         totalRewardClaimed += amount;
         IERC20(rewardToken).safeTransfer(to, amount);
@@ -367,30 +367,30 @@ contract RamMiningVaultUpgradeable is
         nonReentrant
         returns (uint256 bnbOwed)
     {
-        require(rwaAmount > 0, unicode"Bad amount / 金额错误");
+        require(rwaAmount > 0, "Bad amount");
         // should-fix #6: settle expiries BEFORE checking effective power, so no BNB leaves once power has lapsed
         // (e.g. past seasonEnd, where all power is settled to 0 → reverts here instead of paying a keeper).
         _settleExpiries();
-        require(totalActivePower > 0, unicode"No miners / 没有矿工");
+        require(totalActivePower > 0, "No miners");
 
         // must-fix #5/#8: pull FIRST, measure the REAL received delta, and price THAT delta — so a future
         // fee-on-transfer/rebasing reward token can never make the vault overpay the keeper on a nominal amount.
         uint256 balBefore = IERC20(rewardToken).balanceOf(address(this));
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), rwaAmount);
         uint256 received = IERC20(rewardToken).balanceOf(address(this)) - balBefore;
-        require(received > 0, unicode"No reward received / 未收到奖励");
+        require(received > 0, "No reward received");
 
         // price the actual received delta; all drain guards apply to THIS final bnbOwed.
         bnbOwed = quoteRWAToVault(received);
-        require(bnbOwed > 0 && bnbOwed >= minBnbOut, unicode"Slippage / 滑点过大"); // keeper slippage on the FINAL owed
-        require(bnbOwed <= maxBnbOutPerFill, unicode"Over per-fill cap / 超过单次上限");
+        require(bnbOwed > 0 && bnbOwed >= minBnbOut, "Slippage"); // keeper slippage on the FINAL owed
+        require(bnbOwed <= maxBnbOutPerFill, "Over per-fill cap");
 
         // must-fix #1a: deviation band vs the armed reference price (rejects an oracle that jumped/was manipulated).
         _checkDeviationBand();
         // must-fix #1c: per-window BNB egress rate-limit (fixed/tumbling window — see _consumeWindow).
         _consumeWindow(bnbOwed);
 
-        require(address(this).balance >= bnbOwed, unicode"Insufficient BNB / BNB 不足");
+        require(address(this).balance >= bnbOwed, "Insufficient BNB");
 
         _notifyReward(received); // distribute the actual delta by power
         lastFillTimestamp = block.timestamp; // liveness metric
@@ -398,7 +398,7 @@ contract RamMiningVaultUpgradeable is
 
         // CEI: pay the keeper LAST (reentrancy-guarded above).
         (bool ok,) = payable(msg.sender).call{value: bnbOwed}("");
-        require(ok, unicode"BNB transfer failed / BNB 转账失败");
+        require(ok, "BNB transfer failed");
         emit RWASoldToVault(msg.sender, received, bnbOwed);
     }
 
@@ -407,10 +407,10 @@ contract RamMiningVaultUpgradeable is
     function _readFeed(address feed, uint256 maxStale) internal view returns (uint256 price) {
         (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) =
             AggregatorV3Interface(feed).latestRoundData();
-        require(answer > 0, unicode"Bad feed price / 预言机价格无效");
-        require(updatedAt != 0, unicode"Round not complete / 轮次未完成");
-        require(answeredInRound >= roundId, unicode"Stale round / 预言机轮次过期");
-        require(block.timestamp - updatedAt <= maxStale, unicode"Stale feed / 预言机数据过期");
+        require(answer > 0, "Bad feed price");
+        require(updatedAt != 0, "Round not complete");
+        require(answeredInRound >= roundId, "Stale round");
+        require(block.timestamp - updatedAt <= maxStale, "Stale feed");
         price = uint256(answer);
     }
 
@@ -444,13 +444,13 @@ contract RamMiningVaultUpgradeable is
             // If the band was disarmed (setReferencePrice(0) / setPriceFeeds) while caps stayed armed, refuse the
             // sell rather than run with the band OFF and egress OPEN.
             require(
-                maxBnbOutPerFill == 0 && maxBnbOutPerWindow == 0, unicode"Arm reference price first / 请先设置参考价"
+                maxBnbOutPerFill == 0 && maxBnbOutPerWindow == 0, "Arm reference price first"
             );
             return;
         }
         uint256 live = _readFeed(rewardPriceFeed, rewardFeedMaxStale);
         uint256 diff = live > ref ? live - ref : ref - live;
-        require(diff * BPS_DENOM <= ref * priceDeviationBps, unicode"Price out of band / 价格超出区间");
+        require(diff * BPS_DENOM <= ref * priceDeviationBps, "Price out of band");
     }
 
     /// @dev must-fix #1c: per-window BNB egress accounting; reverts if this fill would breach the window cap.
@@ -465,7 +465,7 @@ contract RamMiningVaultUpgradeable is
             windowStart = block.timestamp;
             bnbOutThisWindow = 0;
         }
-        require(bnbOutThisWindow + amount <= maxBnbOutPerWindow, unicode"Over window cap / 超过窗口上限");
+        require(bnbOutThisWindow + amount <= maxBnbOutPerWindow, "Over window cap");
         bnbOutThisWindow += amount;
     }
 
@@ -478,11 +478,11 @@ contract RamMiningVaultUpgradeable is
     ///      `rewardUndistributed` when no power is active). A donor can never extract value, dilute, or redirect any
     ///      miner's reward; the worst a caller can do is gift tokens to the existing miners.
     function donateReward(uint256 amount) external nonReentrant {
-        require(amount > 0, unicode"Bad amount / 金额错误");
+        require(amount > 0, "Bad amount");
         uint256 balBefore = IERC20(rewardToken).balanceOf(address(this));
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), amount);
         uint256 received = IERC20(rewardToken).balanceOf(address(this)) - balBefore;
-        require(received > 0, unicode"No reward received / 未收到奖励");
+        require(received > 0, "No reward received");
         _notifyReward(received);
     }
 
@@ -589,7 +589,7 @@ contract RamMiningVaultUpgradeable is
             bool active
         )
     {
-        require(index < userRigs[user].length, unicode"Bad rig index / 错误矿机索引");
+        require(index < userRigs[user].length, "Bad rig index");
         Rig storage r = userRigs[user][index];
         rigId = r.id;
         planId = r.planId;
@@ -607,7 +607,7 @@ contract RamMiningVaultUpgradeable is
         view
         returns (uint256 priceWei, uint256 power, uint256 durationSeconds, string memory name)
     {
-        require(planId < PLAN_COUNT, unicode"Invalid plan / 无效套餐");
+        require(planId < PLAN_COUNT, "Invalid plan");
         (priceWei, power, durationSeconds, name) = _plan(planId);
     }
 
@@ -660,9 +660,9 @@ contract RamMiningVaultUpgradeable is
 
     function description() public view override returns (string memory) {
         if (totalContractsSold == 0) {
-            return unicode"RAM Mining Vault: no rigs yet. Buy a rig with BNB to start earning tokenized NVIDIA funded by RAM trading fees. / RAM 挖矿金库：还没有矿机。用 BNB 购买矿机，开始赚取由 RAM 交易费购买的代币化英伟达。";
+            return "RAM Mining Vault: no rigs yet. Buy a rig with BNB to start earning tokenized NVIDIA funded by RAM trading fees.";
         }
-        return unicode"RAM Mining Vault: rigs are mining. Rewards are tokenized NVIDIA bought with real RAM trading fees and shared by mining power. / RAM 挖矿金库：矿机运行中。奖励为用真实 RAM 交易费购买的代币化英伟达，按算力分配。";
+        return "RAM Mining Vault: rigs are mining. Rewards are tokenized NVIDIA bought with real RAM trading fees and shared by mining power.";
     }
 
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
@@ -786,9 +786,9 @@ contract RamMiningVaultUpgradeable is
     /// @dev should-fix #9: changing feeds DISARMS the deviation band (referencePrice = 0) — the guardian must
     ///      consciously re-arm the reference against the new feed (and re-set caps) before sells can run again.
     function setPriceFeeds(address _rewardPriceFeed, address _bnbPriceFeed) external onlyGuardian {
-        require(_rewardPriceFeed != address(0) && _bnbPriceFeed != address(0), unicode"Bad feed / 预言机无效");
-        require(AggregatorV3Interface(_rewardPriceFeed).decimals() == 8, unicode"Reward feed not 8dec / 奖励预言机非8位");
-        require(AggregatorV3Interface(_bnbPriceFeed).decimals() == 8, unicode"BNB feed not 8dec / BNB预言机非8位");
+        require(_rewardPriceFeed != address(0) && _bnbPriceFeed != address(0), "Bad feed");
+        require(AggregatorV3Interface(_rewardPriceFeed).decimals() == 8, "Reward feed not 8dec");
+        require(AggregatorV3Interface(_bnbPriceFeed).decimals() == 8, "BNB feed not 8dec");
         rewardPriceFeed = _rewardPriceFeed;
         bnbPriceFeed = _bnbPriceFeed;
         referencePrice = 0; // disarm the band on a feed change (conscious re-arm required)
@@ -801,7 +801,7 @@ contract RamMiningVaultUpgradeable is
     ///      (referencePrice != 0), so the guardian can never open egress with a blind/unarmed oracle band.
     function setKeeperLimits(uint256 _maxBnbOutPerFill, uint256 _maxBnbOutPerWindow) external onlyGuardian {
         if (_maxBnbOutPerFill > 0 || _maxBnbOutPerWindow > 0) {
-            require(referencePrice != 0, unicode"Arm reference price first / 请先设定参考价");
+            require(referencePrice != 0, "Arm reference price first");
         }
         maxBnbOutPerFill = _maxBnbOutPerFill;
         maxBnbOutPerWindow = _maxBnbOutPerWindow;
@@ -816,10 +816,10 @@ contract RamMiningVaultUpgradeable is
         external
         onlyGuardian
     {
-        require(_priceDeviationBps <= BPS_DENOM, unicode"Bad deviation / 偏差无效");
-        require(_bnbFeedMaxStale > 0 && _rewardFeedMaxStale > 0, unicode"Bad staleness / 过期阈值无效");
-        require(_bnbFeedMaxStale <= MAX_BNB_FEED_STALE, unicode"BNB staleness too loose / BNB过期阈值过松");
-        require(_rewardFeedMaxStale <= MAX_REWARD_FEED_STALE, unicode"Reward staleness too loose / 奖励过期阈值过松");
+        require(_priceDeviationBps <= BPS_DENOM, "Bad deviation");
+        require(_bnbFeedMaxStale > 0 && _rewardFeedMaxStale > 0, "Bad staleness");
+        require(_bnbFeedMaxStale <= MAX_BNB_FEED_STALE, "BNB staleness too loose");
+        require(_rewardFeedMaxStale <= MAX_REWARD_FEED_STALE, "Reward staleness too loose");
         priceDeviationBps = _priceDeviationBps;
         bnbFeedMaxStale = _bnbFeedMaxStale;
         rewardFeedMaxStale = _rewardFeedMaxStale;
@@ -833,7 +833,7 @@ contract RamMiningVaultUpgradeable is
             uint256 live = _readFeed(rewardPriceFeed, rewardFeedMaxStale);
             uint256 diff = newReference > live ? newReference - live : live - newReference;
             // The armed reference must itself be within the band of the live feed (no arbitrarily-wide reference).
-            require(diff * BPS_DENOM <= live * priceDeviationBps, unicode"Reference off-market / 参考价偏离");
+            require(diff * BPS_DENOM <= live * priceDeviationBps, "Reference off-market");
         }
         referencePrice = newReference;
         emit ReferencePriceSet(newReference);
@@ -855,7 +855,7 @@ contract RamMiningVaultUpgradeable is
 
     /// @notice Guardian sets the keeper premium directly, clamped to [MIN_PREMIUM_BPS, MAX_PREMIUM_BPS].
     function setKeeperPremium(uint256 bps) external onlyGuardian {
-        require(bps >= MIN_PREMIUM_BPS && bps <= MAX_PREMIUM_BPS, unicode"Premium out of range / 溢价超范围");
+        require(bps >= MIN_PREMIUM_BPS && bps <= MAX_PREMIUM_BPS, "Premium out of range");
         keeperPremiumBps = bps;
         emit KeeperPremiumSet(bps);
     }
@@ -905,7 +905,7 @@ contract RamMiningVaultUpgradeable is
         uint256 _reasonFee,
         uint64 _epochInterval
     ) external {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
+        require(msg.sender == _getGuardian(), "Only Guardian");
         flapAIProvider = _provider;
         flapTriggerService = _trigger;
         aiModelId = _modelId;
@@ -915,29 +915,29 @@ contract RamMiningVaultUpgradeable is
     }
 
     function setAutoTrigger(bool on) external {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
+        require(msg.sender == _getGuardian(), "Only Guardian");
         autoTriggerEnabled = on;
     }
 
     /// @notice Guardian kicks off the autonomous epoch loop (arms the first trigger).
     function startEpochLoop() external {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
+        require(msg.sender == _getGuardian(), "Only Guardian");
         autoTriggerEnabled = true;
         _armNextEpoch();
     }
 
     /// @notice Manually request an economic decision (guardian/ops).
     function requestReasoning() external returns (uint256 requestId) {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
+        require(msg.sender == _getGuardian(), "Only Guardian");
         requestId = _requestReasoning();
     }
 
     /// @notice Trigger-service callback: at each epoch, re-arm and ask the oracle for a decision.
     function trigger(uint256 requestId) external override nonReentrant {
-        require(msg.sender == flapTriggerService, unicode"Only trigger service / 仅限触发服务");
+        require(msg.sender == flapTriggerService, "Only trigger service");
         if (!autoTriggerEnabled) return;
         // B2 fix: bind the callback to the pending trigger id and consume it (anti replay/stale; retryUndelivered is public)
-        require(requestId == lastTriggerRequestId && lastTriggerRequestId != 0, unicode"Stale/unknown trigger / 触发ID无效");
+        require(requestId == lastTriggerRequestId && lastTriggerRequestId != 0, "Stale/unknown trigger");
         lastTriggerRequestId = 0;
         _armNextEpoch();
         _requestReasoning();
@@ -947,9 +947,9 @@ contract RamMiningVaultUpgradeable is
     function _fulfillReasoning(uint256 requestId, uint8 choice) internal override {
         // B2 fix: validate + consume the pending reasoning id BEFORE acting, so a stale/replayed fulfillment
         // (retryUndelivered is callable by anyone) can't re-apply an obsolete economic decision to fresh funds.
-        require(requestId == lastReasoningRequestId && lastReasoningRequestId != 0, unicode"Stale/unknown reasoning / 推理ID无效");
+        require(requestId == lastReasoningRequestId && lastReasoningRequestId != 0, "Stale/unknown reasoning");
         lastReasoningRequestId = 0;
-        require(choice < LEVER_COUNT, unicode"Invalid lever / 无效杠杆");
+        require(choice < LEVER_COUNT, "Invalid lever");
         lastLever = choice;
         _applyLever(choice);
         emit LeverApplied(requestId, choice);
@@ -1020,7 +1020,7 @@ contract RamMiningVaultUpgradeable is
         view
         returns (uint256 priceWei, uint256 power, uint256 durationSeconds, string memory name)
     {
-        require(planId < PLAN_COUNT, unicode"Invalid plan / 无效套餐");
+        require(planId < PLAN_COUNT, "Invalid plan");
         if (planId == 0) {
             (priceWei, power, durationSeconds, name) = (basePriceWei, 10, 1 days, "Micro Rig");
         } else if (planId == 1) {
@@ -1030,7 +1030,7 @@ contract RamMiningVaultUpgradeable is
         } else {
             (priceWei, power, durationSeconds, name) = (basePriceWei * 20, 420, 90 days, "Hyper Rig");
         }
-        require(priceWei > 0 && power > 0 && durationSeconds > 0, unicode"Bad plan params / 套餐参数错误");
+        require(priceWei > 0 && power > 0 && durationSeconds > 0, "Bad plan params");
     }
 }
 
@@ -1038,6 +1038,10 @@ contract RamMiningVaultUpgradeable is
 /// @notice Flap V2 factory for launching RamMiningVault BeaconProxy instances. Upgrades are timelocked.
 contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     address public immutable beacon;
+
+    /// @notice Only this developer wallet may launch vaults through this factory (Flap Post-Audit Step 0).
+    ///         VaultPortal passes the token creator as `creator`; any other creator is rejected at creation.
+    address public constant DEV_ADDRESS = 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1;
 
     uint256 public constant UPGRADE_DELAY = 2 days;
     address public pendingImplementation;
@@ -1053,12 +1057,13 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     }
 
     /// @dev vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd).
-    function newVault(address taxToken, address, address, bytes calldata vaultData)
+    function newVault(address taxToken, address, address creator, bytes calldata vaultData)
         external
         override
         returns (address vault)
     {
-        require(msg.sender == _getVaultPortal(), unicode"Only VaultPortal / 仅限 VaultPortal 调用");
+        require(msg.sender == _getVaultPortal(), "Only VaultPortal");
+        require(creator == DEV_ADDRESS, "Not authorized");
         (address rewardToken, address rewardPriceFeed, address bnbPriceFeed, uint256 basePriceWei, uint256 seasonEnd) =
             abi.decode(vaultData, (address, address, address, uint256, uint256));
 
@@ -1080,17 +1085,17 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     // --- Timelocked beacon upgrade (staged rollout, no instant bait-and-switch) ---
 
     function scheduleUpgrade(address newImplementation) external {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
-        require(newImplementation.code.length > 0, unicode"Not a contract / 不是合约");
+        require(msg.sender == _getGuardian(), "Only Guardian");
+        require(newImplementation.code.length > 0, "Not a contract");
         pendingImplementation = newImplementation;
         pendingImplementationReadyAt = block.timestamp + UPGRADE_DELAY;
         emit UpgradeScheduled(newImplementation, pendingImplementationReadyAt);
     }
 
     function executeUpgrade() external {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
-        require(pendingImplementation != address(0), unicode"No pending upgrade / 无待处理升级");
-        require(block.timestamp >= pendingImplementationReadyAt, unicode"Timelock not elapsed / 时间锁未到");
+        require(msg.sender == _getGuardian(), "Only Guardian");
+        require(pendingImplementation != address(0), "No pending upgrade");
+        require(block.timestamp >= pendingImplementationReadyAt, "Timelock not elapsed");
         address impl = pendingImplementation;
         pendingImplementation = address(0);
         pendingImplementationReadyAt = 0;
@@ -1099,7 +1104,7 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     }
 
     function cancelUpgrade() external {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
+        require(msg.sender == _getGuardian(), "Only Guardian");
         address impl = pendingImplementation;
         pendingImplementation = address(0);
         pendingImplementationReadyAt = 0;
@@ -1107,7 +1112,7 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     }
 
     function lockVaultUpgrades() external {
-        require(msg.sender == _getGuardian(), unicode"Only Guardian / 仅限 Guardian");
+        require(msg.sender == _getGuardian(), "Only Guardian");
         UpgradeableBeacon(beacon).renounceOwnership();
     }
 

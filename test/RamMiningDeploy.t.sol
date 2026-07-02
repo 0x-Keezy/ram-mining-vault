@@ -70,7 +70,7 @@ contract RamMiningDeployTest is Test {
         // launch through the VaultPortal (as Flap would)
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         RamMiningVaultUpgradeable vault =
-            RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vaultData)));
+            RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
 
         assertEq(vault.rewardToken(), address(reward));
         assertEq(vault.rewardPriceFeed(), address(nvdaFeed));

@@ -89,7 +89,7 @@ contract RamMiningVaultAgentTest is Test {
         bytes memory vaultData =
             abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
-        vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vaultData)));
+        vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
 
         vm.prank(GUARDIAN);
         vault.configureAgent(address(ai), address(triggerSvc), 1, 0, uint64(1 days));
@@ -111,7 +111,7 @@ contract RamMiningVaultAgentTest is Test {
     // ── config / access ────────────────────────────────────────────────
 
     function testConfigureAgentOnlyGuardian() public {
-        vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
+        vm.expectRevert(bytes("Only Guardian"));
         vault.configureAgent(address(ai), address(triggerSvc), 1, 0, uint64(1 days));
     }
 
@@ -123,7 +123,7 @@ contract RamMiningVaultAgentTest is Test {
     function testInvalidLeverReverts() public {
         vm.prank(GUARDIAN);
         uint256 id = vault.requestReasoning();
-        vm.expectRevert(bytes(unicode"Invalid lever / 无效杠杆"));
+        vm.expectRevert(bytes("Invalid lever"));
         ai.fulfill(address(vault), id, 4); // LEVER_COUNT == 4 -> 4 (old PAUSE lever) is now out of range
     }
 
@@ -183,7 +183,7 @@ contract RamMiningVaultAgentTest is Test {
     // ── trigger / epoch loop ─────────────────────────────────────────────
 
     function testTriggerOnlyService() public {
-        vm.expectRevert(bytes(unicode"Only trigger service / 仅限触发服务"));
+        vm.expectRevert(bytes("Only trigger service"));
         vault.trigger(1);
     }
 
@@ -214,7 +214,7 @@ contract RamMiningVaultAgentTest is Test {
         assertEq(vault.lastReasoningRequestId(), 0);
 
         // replaying the SAME (already consumed) id must revert — a stale decision can't re-apply to fresh funds
-        vm.expectRevert(bytes(unicode"Stale/unknown reasoning / 推理ID无效"));
+        vm.expectRevert(bytes("Stale/unknown reasoning"));
         ai.fulfill(address(vault), id, 1);
     }
 
@@ -222,7 +222,7 @@ contract RamMiningVaultAgentTest is Test {
         vm.prank(GUARDIAN);
         vault.requestReasoning(); // arms lastReasoningRequestId
         // a different id than the pending one must revert
-        vm.expectRevert(bytes(unicode"Stale/unknown reasoning / 推理ID无效"));
+        vm.expectRevert(bytes("Stale/unknown reasoning"));
         ai.fulfill(address(vault), 999_999, 1);
     }
 
@@ -233,7 +233,7 @@ contract RamMiningVaultAgentTest is Test {
 
         triggerSvc.fire(address(vault), armedId); // consumes armedId, re-arms a fresh one
         // firing the old (consumed) trigger id again must revert
-        vm.expectRevert(bytes(unicode"Stale/unknown trigger / 触发ID无效"));
+        vm.expectRevert(bytes("Stale/unknown trigger"));
         triggerSvc.fire(address(vault), armedId);
     }
 

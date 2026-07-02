@@ -54,7 +54,7 @@ contract RamMiningVaultForkTest is Test {
             block.timestamp + 120 days
         );
         vm.prank(BNB_MAINNET_VAULT_PORTAL);
-        vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vaultData)));
+        vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
         // BNB/USD tight (24/7), NVDA/USD generous (weekend continuous operation per Flap #8).
         vm.prank(GUARDIAN_MAINNET);
         vault.setOracleGuards(500, 2 hours, _rewardStale());

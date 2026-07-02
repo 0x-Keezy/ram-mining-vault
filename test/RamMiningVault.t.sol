@@ -187,7 +187,7 @@ contract RamMiningVaultTest is Test {
             abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
 
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
-        address vaultAddress = factory.newVault(RAM_TOKEN, address(0), address(this), vaultData);
+        address vaultAddress = factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData);
         vault = RamMiningVaultUpgradeable(payable(vaultAddress));
 
         vm.deal(alice, 100 ether);
@@ -225,7 +225,7 @@ contract RamMiningVaultTest is Test {
     function _deployVault(address rewardTok) internal returns (RamMiningVaultUpgradeable v) {
         bytes memory vd = abi.encode(rewardTok, address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
-        v = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vd)));
+        v = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd)));
     }
 
     function _inject(uint256 amount) internal {
@@ -265,8 +265,18 @@ contract RamMiningVaultTest is Test {
     /// Rule 002 / reference test: newVault must revert for any caller other than the VaultPortal.
     function testFactoryRejectsNonVaultPortalCaller() public {
         bytes memory vd = abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
-        vm.expectRevert(bytes(unicode"Only VaultPortal / 仅限 VaultPortal 调用"));
-        factory.newVault(RAM_TOKEN, address(0), address(this), vd); // not pranked as the portal
+        vm.expectRevert(bytes("Only VaultPortal"));
+        factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd); // not pranked as the portal
+    }
+
+    /// Flap Post-Audit Step 0: even when called by the VaultPortal, only the authorized dev wallet may
+    /// launch a vault through this factory. Any other creator is rejected at creation.
+    function testFactoryRejectsNonDevCreator() public {
+        assertEq(factory.DEV_ADDRESS(), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1);
+        bytes memory vd = abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
+        vm.prank(BNB_TESTNET_VAULT_PORTAL);
+        vm.expectRevert(bytes("Not authorized"));
+        factory.newVault(RAM_TOKEN, address(0), address(0xBAD), vd);
     }
 
     /// description() must reflect state (no rigs yet → mining), per the integration-test guide.
@@ -386,7 +396,7 @@ contract RamMiningVaultTest is Test {
             abi.encode(address(reward8), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         RamMiningVaultUpgradeable v8 =
-            RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vaultData)));
+            RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
         assertEq(v8.rewardTokenDecimals(), 8);
 
         uint256 owed8 = v8.quoteRWAToVault(1e8); // 1 token in 8 dec
@@ -421,7 +431,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"No miners / 没有矿工"));
+        vm.expectRevert(bytes("No miners"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -436,7 +446,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Slippage / 滑点过大"));
+        vm.expectRevert(bytes("Slippage"));
         vault.sellRWAToVault(1e18, quoted + 1); // demand more than the quote
         vm.stopPrank();
     }
@@ -453,7 +463,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Over per-fill cap / 超过单次上限"));
+        vm.expectRevert(bytes("Over per-fill cap"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -473,7 +483,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Over window cap / 超过窗口上限"));
+        vm.expectRevert(bytes("Over window cap"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
 
@@ -533,7 +543,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Over per-fill cap / 超过单次上限"));
+        vm.expectRevert(bytes("Over per-fill cap"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -558,7 +568,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Price out of band / 价格超出区间"));
+        vm.expectRevert(bytes("Price out of band"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -607,7 +617,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Stale feed / 预言机数据过期"));
+        vm.expectRevert(bytes("Stale feed"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -623,7 +633,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Stale feed / 预言机数据过期"));
+        vm.expectRevert(bytes("Stale feed"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -638,7 +648,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Bad feed price / 预言机价格无效"));
+        vm.expectRevert(bytes("Bad feed price"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -654,7 +664,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Stale round / 预言机轮次过期"));
+        vm.expectRevert(bytes("Stale round"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -704,21 +714,22 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Over per-fill cap / 超过单次上限"));
+        vm.expectRevert(bytes("Over per-fill cap"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
 
     function testSetKeeperPremiumOnlyGuardianAndClamped() public {
+        // setKeeperPremium is gated by the Flap template's guard (VaultBaseV2), whose message we don't touch
         vm.expectRevert(bytes(unicode"Only Guardian / 仅 Guardian"));
         vault.setKeeperPremium(10100);
 
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Premium out of range / 溢价超范围"));
+        vm.expectRevert(bytes("Premium out of range"));
         vault.setKeeperPremium(9999); // below MIN
 
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Premium out of range / 溢价超范围"));
+        vm.expectRevert(bytes("Premium out of range"));
         vault.setKeeperPremium(10401); // above MAX (10400)
 
         vm.prank(GUARDIAN);
@@ -763,12 +774,12 @@ contract RamMiningVaultTest is Test {
     function testSetOracleGuardsCeilings() public {
         // reward-feed staleness above MAX_REWARD_FEED_STALE (30d) -> revert
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Reward staleness too loose / 奖励过期阈值过松"));
+        vm.expectRevert(bytes("Reward staleness too loose"));
         vault.setOracleGuards(200, 2 hours, 31 days);
 
         // BNB-feed staleness above MAX_BNB_FEED_STALE (1d) -> revert
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"BNB staleness too loose / BNB过期阈值过松"));
+        vm.expectRevert(bytes("BNB staleness too loose"));
         vault.setOracleGuards(200, 2 days, 7 days);
 
         // valid: NVDA 7d, BNB 6h
@@ -791,7 +802,7 @@ contract RamMiningVaultTest is Test {
         }
         (uint256 price,,,) = vault.getPlan(0);
         vm.prank(alice);
-        vm.expectRevert(bytes(unicode"Too many rigs / 矿机数量过多"));
+        vm.expectRevert(bytes("Too many rigs"));
         vault.buyMiningContract{value: price}(0);
     }
 
@@ -815,7 +826,7 @@ contract RamMiningVaultTest is Test {
         vm.warp(seasonEnd + 1);
         (uint256 price,,,) = vault.getPlan(0);
         vm.prank(alice);
-        vm.expectRevert(bytes(unicode"Mining season ended / 挖矿赛季已结束"));
+        vm.expectRevert(bytes("Mining season ended"));
         vault.buyMiningContract{value: price}(0);
     }
 
@@ -829,7 +840,7 @@ contract RamMiningVaultTest is Test {
             abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, shortSeason);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         RamMiningVaultUpgradeable v =
-            RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), address(this), vd)));
+            RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd)));
 
         (uint256 price,,,) = v.getPlan(0);
         vm.deal(alice, 1 ether);
@@ -841,7 +852,7 @@ contract RamMiningVaultTest is Test {
         // warp into the season-end bucket: a new rig's end caps to seasonEnd in the already-settled bucket -> reject
         vm.warp(block.timestamp + 25 hours);
         vm.prank(alice);
-        vm.expectRevert(bytes(unicode"Rig ends too soon / 套餐过短"));
+        vm.expectRevert(bytes("Rig ends too soon"));
         v.buyMiningContract{value: price}(0);
     }
 
@@ -906,11 +917,11 @@ contract RamMiningVaultTest is Test {
     function testSetPriceFeedsRejectsNon8Decimals() public {
         MockPriceFeed bad = new MockPriceFeed(18, 100e8);
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Reward feed not 8dec / 奖励预言机非8位"));
+        vm.expectRevert(bytes("Reward feed not 8dec"));
         vault.setPriceFeeds(address(bad), address(bnbFeed));
 
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"BNB feed not 8dec / BNB预言机非8位"));
+        vm.expectRevert(bytes("BNB feed not 8dec"));
         vault.setPriceFeeds(address(nvdaFeed), address(bad));
     }
 
@@ -918,8 +929,8 @@ contract RamMiningVaultTest is Test {
         MockPriceFeed bad = new MockPriceFeed(6, 100e8);
         bytes memory vd = abi.encode(address(reward), address(bad), address(bnbFeed), basePrice, seasonEnd);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
-        vm.expectRevert(bytes(unicode"Reward feed not 8dec / 奖励预言机非8位"));
-        factory.newVault(RAM_TOKEN, address(0), address(this), vd);
+        vm.expectRevert(bytes("Reward feed not 8dec"));
+        factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd);
     }
 
     /// should-fix #9: changing feeds disarms the deviation band (referencePrice -> 0).
@@ -934,7 +945,7 @@ contract RamMiningVaultTest is Test {
     /// blocker #4b: enabling egress caps requires the deviation band to be armed first.
     function testSetKeeperLimitsRequiresReference() public {
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Arm reference price first / 请先设定参考价"));
+        vm.expectRevert(bytes("Arm reference price first"));
         vault.setKeeperLimits(1 ether, 1 ether);
 
         _armReference();
@@ -966,7 +977,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes(unicode"Arm reference price first / 请先设置参考价"));
+        vm.expectRevert(bytes("Arm reference price first"));
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
 
@@ -984,7 +995,7 @@ contract RamMiningVaultTest is Test {
         factory.scheduleUpgrade(address(newImpl));
 
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Timelock not elapsed / 时间锁未到"));
+        vm.expectRevert(bytes("Timelock not elapsed"));
         factory.executeUpgrade();
 
         vm.warp(block.timestamp + factory.UPGRADE_DELAY());
@@ -995,7 +1006,7 @@ contract RamMiningVaultTest is Test {
 
     function testScheduleUpgradeOnlyGuardian() public {
         RamMiningVaultUpgradeable newImpl = new RamMiningVaultUpgradeable();
-        vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
+        vm.expectRevert(bytes("Only Guardian"));
         factory.scheduleUpgrade(address(newImpl));
     }
 
@@ -1017,7 +1028,7 @@ contract RamMiningVaultTest is Test {
     }
 
     function testNonGuardianCannotLockVaultUpgrades() public {
-        vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
+        vm.expectRevert(bytes("Only Guardian"));
         factory.lockVaultUpgrades();
         assertFalse(factory.isVaultUpgradesLocked());
     }
@@ -1030,7 +1041,7 @@ contract RamMiningVaultTest is Test {
         vm.prank(alice);
         vault.claimRewards();
         vm.prank(alice);
-        vm.expectRevert(bytes(unicode"Nothing to claim / 无可领取"));
+        vm.expectRevert(bytes("Nothing to claim"));
         vault.claimRewards();
     }
 
