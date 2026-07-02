@@ -183,6 +183,7 @@ contract RamMiningVaultTest is Test {
     address constant BNB_TESTNET_VAULT_PORTAL = 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f;
     address constant GUARDIAN = 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950;
     address constant RAM_TOKEN = address(0x4A11); // taxToken placeholder (not held by vault)
+    address constant TREASURY = address(0x7E57); // dedicated 15%-share treasury wallet (Phase-2)
 
     // oracle prices (8 dec): NVDA = $130, BNB = $600
     int256 constant NVDA_USD = 130e8;
@@ -227,7 +228,8 @@ contract RamMiningVaultTest is Test {
             seasonEnd,
             address(ramOracle),
             RAM_BNB_PRICE / 2,
-            RAM_BNB_PRICE * 2
+            RAM_BNB_PRICE * 2,
+            TREASURY
         );
 
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
@@ -274,7 +276,7 @@ contract RamMiningVaultTest is Test {
     /// @dev Deploy a fresh vault pointed at an arbitrary reward token (8↔18 / fee-on-transfer / reentrancy tests).
     function _deployVault(address rewardTok) internal returns (RamMiningVaultUpgradeable v) {
         bytes memory vd =
-            abi.encode(rewardTok, address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0);
+            abi.encode(rewardTok, address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0, TREASURY);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         v = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd)));
     }
@@ -308,7 +310,7 @@ contract RamMiningVaultTest is Test {
 
     function testFactorySchema() public view {
         VaultDataSchema memory s = factory.vaultDataSchema();
-        assertEq(s.fields.length, 8);
+        assertEq(s.fields.length, 9);
         assertEq(s.fields[0].name, "rewardToken");
         assertEq(s.fields[1].name, "rewardPriceFeed");
         assertEq(s.fields[2].name, "bnbPriceFeed");
@@ -317,6 +319,7 @@ contract RamMiningVaultTest is Test {
         assertEq(s.fields[5].name, "ramPriceOracle");
         assertEq(s.fields[6].name, "ramCageMin");
         assertEq(s.fields[7].name, "ramCageMax");
+        assertEq(s.fields[8].name, "ramTreasuryWallet");
         assertFalse(s.isArray);
         assertTrue(factory.isQuoteTokenSupported(address(0)));
         assertFalse(factory.isQuoteTokenSupported(RAM_TOKEN));
@@ -325,7 +328,7 @@ contract RamMiningVaultTest is Test {
     /// Rule 002 / reference test: newVault must revert for any caller other than the VaultPortal.
     function testFactoryRejectsNonVaultPortalCaller() public {
         bytes memory vd =
-            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0);
+            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0, TREASURY);
         vm.expectRevert(OnlyVaultPortal.selector);
         factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd); // not pranked as the portal
     }
@@ -335,7 +338,7 @@ contract RamMiningVaultTest is Test {
     function testFactoryRejectsNonDevCreator() public {
         assertEq(factory.DEV_ADDRESS(), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1);
         bytes memory vd =
-            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0);
+            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0, TREASURY);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         vm.expectRevert(NotAuthorized.selector);
         factory.newVault(RAM_TOKEN, address(0), address(0xBAD), vd);
@@ -447,7 +450,7 @@ contract RamMiningVaultTest is Test {
         // a fresh 8-decimal reward token vault should quote the SAME BNB for "1 token" as the 18-dec one
         MockRewardToken reward8 = new MockRewardToken(8);
         bytes memory vaultData =
-            abi.encode(address(reward8), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0);
+            abi.encode(address(reward8), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0, TREASURY);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         RamMiningVaultUpgradeable v8 =
             RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
@@ -891,7 +894,7 @@ contract RamMiningVaultTest is Test {
         // short season so a rig can be capped into the current bucket near seasonEnd
         uint256 shortSeason = block.timestamp + 36 hours; // 1.5 days (>= block.timestamp + 1 day)
         bytes memory vd =
-            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, shortSeason, address(0), 0, 0);
+            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, shortSeason, address(0), 0, 0, TREASURY);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         RamMiningVaultUpgradeable v =
             RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd)));
@@ -982,7 +985,7 @@ contract RamMiningVaultTest is Test {
     function testInitRejectsNon8DecimalFeed() public {
         MockPriceFeed bad = new MockPriceFeed(6, 100e8);
         bytes memory vd =
-            abi.encode(address(reward), address(bad), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0);
+            abi.encode(address(reward), address(bad), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0, TREASURY);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         vm.expectRevert(BadFeedDecimals.selector);
         factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd);

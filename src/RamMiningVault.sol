@@ -233,7 +233,12 @@ contract RamMiningVaultUpgradeable is
     uint256 public ramPriceCageMin; // BNB-per-RAM floor (18 dec): degraded-mode price + lower clamp. 0 = not armed
     uint256 public ramPriceCageMax; // BNB-per-RAM ceiling (18 dec): upper clamp on the trusted market read
     uint256 public repairCostBps; // repair price as bps of the rig's plan price (bounded [2500, 7500])
-    uint256 public ramTreasuryRetained; // 15% share of RAM sink payments retained by the vault (NEVER market-sold)
+    /// @dev Dedicated treasury wallet receiving the 15% share of every RAM sink payment (paid out in the same
+    ///      tx). Set ONCE at initialize via vaultData — there is deliberately NO setter: the destination is
+    ///      immutable per vault, changeable only via the Guardian-gated, timelocked beacon upgrade. Kept separate
+    ///      from the factory dev-lock wallet by design (ops separation).
+    address public ramTreasuryWallet;
+    uint256 public totalRamTreasuryPaid; // lifetime 15% treasury share of RAM sink payments (paid to ramTreasuryWallet)
     uint256 public totalRamPaid; // lifetime RAM received through sinks
     uint256 public totalRamBurned; // lifetime RAM burned to RAM_BURN_ADDR
 
@@ -243,7 +248,7 @@ contract RamMiningVaultUpgradeable is
     ///      v3 appended 8 slots (Phase-2 economy) → gap shrunk 44 → 36. NOTE: the Rig struct gained fields, which
     ///      is safe ONLY because v3 deploys as a FRESH beacon implementation for NEW vaults (never an in-place
     ///      upgrade of a live v2 vault's storage).
-    uint256[36] private __gap;
+    uint256[35] private __gap;
 
     event RigBought(
         address indexed user,
@@ -289,7 +294,8 @@ contract RamMiningVaultUpgradeable is
         uint256 _seasonEnd,
         address _ramPriceOracle,
         uint256 _ramCageMin,
-        uint256 _ramCageMax
+        uint256 _ramCageMax,
+        address _ramTreasuryWallet
     ) external initializer {
         __ReentrancyGuard_init();
         if (!(_taxToken != address(0))) revert ZeroAddress();
@@ -339,9 +345,11 @@ contract RamMiningVaultUpgradeable is
         // the reward token and feeds in vaultData). Zeros = DISARMED: rig #2+/repair/upgrade revert
         // RamPricingNotArmed until armed. The Guardian keeps the setters either way. Rig #1 in BNB always works.
         if (!(_ramCageMin <= _ramCageMax)) revert BadConfig();
+        if (!(_ramTreasuryWallet != address(0))) revert ZeroAddress();
         ramPriceOracle = _ramPriceOracle;
         ramPriceCageMin = _ramCageMin;
         ramPriceCageMax = _ramCageMax;
+        ramTreasuryWallet = _ramTreasuryWallet;
         repairCostBps = 4000; // 40% of plan price per repair (guardian-tunable within [25%, 75%])
     }
 
@@ -355,7 +363,7 @@ contract RamMiningVaultUpgradeable is
 
     /// @notice Buy a mining rig. Phase-2 two-phase economy: the FIRST rig of a wallet is paid in native BNB
     ///         (the entry — also the honest per-wallet Sybil limiter); every later rig is paid in the RAM tax
-    ///         token, converted from the plan's BNB price via the RAM price oracle (85% burned / 15% retained).
+    ///         token, converted from the plan's BNB price via the RAM price oracle (85% burned / 15% treasury).
     ///         Rigs keep their AUDITED per-plan durations (season-capped) and wear 5% every 3 days to a 47% floor.
     function buyMiningContract(uint256 planId) external payable nonReentrant {
         if (!(planId < PLAN_COUNT)) revert InvalidPlan();
@@ -447,7 +455,7 @@ contract RamMiningVaultUpgradeable is
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    //  Phase-2 economy (v3): repair & upgrade — RAM sinks (85% burn / 15% retained)
+    //  Phase-2 economy (v3): repair & upgrade — RAM sinks (85% burn / 15% treasury wallet)
     // ──────────────────────────────────────────────────────────────────────────
 
     /// @notice Repair a live rig: pay RAM (85% burned) to reset its wear ladder NOW at a restored level. The
@@ -491,9 +499,10 @@ contract RamMiningVaultUpgradeable is
         emit RigUpgraded(msg.sender, r.id, newPlanId, ramPaid, newPower);
     }
 
-    /// @dev Charge a BNB-denominated cost in RAM units through the oracle+cage price, split 85% burn / 15%
-    ///      retained treasury (NEVER market-sold). Delta-measured so a taxed/fee-on-transfer path can't corrupt
-    ///      accounting. Reverts only when the RAM pricing is not armed (safe-by-default) or nothing arrives.
+    /// @dev Charge a BNB-denominated cost in RAM units through the oracle+cage price, split 85% burn (to
+    ///      RAM_BURN_ADDR) / 15% to the dedicated, immutable treasury wallet (same tx). Delta-measured so a
+    ///      taxed/fee-on-transfer path can't corrupt accounting. Reverts only when the RAM pricing is not armed
+    ///      (safe-by-default) or nothing arrives.
     function _chargeRam(uint256 bnbCost) internal returns (uint256 received) {
         uint256 price = _cagedRamPrice(true);
         uint256 units = (bnbCost * 1e18) / price;
@@ -509,7 +518,11 @@ contract RamMiningVaultUpgradeable is
         if (burnAmt > 0) {
             ram.safeTransfer(RAM_BURN_ADDR, burnAmt);
         }
-        ramTreasuryRetained += received - burnAmt;
+        uint256 treasuryShare = received - burnAmt;
+        if (treasuryShare > 0) {
+            ram.safeTransfer(ramTreasuryWallet, treasuryShare);
+        }
+        totalRamTreasuryPaid += treasuryShare;
         totalRamPaid += received;
         totalRamBurned += burnAmt;
     }
@@ -1025,7 +1038,7 @@ contract RamMiningVaultUpgradeable is
         returns (
             uint256 ramPaidLifetime,
             uint256 ramBurnedLifetime,
-            uint256 ramTreasury,
+            uint256 ramTreasuryPaid,
             uint256 cageMin,
             uint256 cageMax,
             uint256 repairCost,
@@ -1034,7 +1047,7 @@ contract RamMiningVaultUpgradeable is
     {
         ramPaidLifetime = totalRamPaid;
         ramBurnedLifetime = totalRamBurned;
-        ramTreasury = ramTreasuryRetained;
+        ramTreasuryPaid = totalRamTreasuryPaid;
         cageMin = ramPriceCageMin;
         cageMax = ramPriceCageMax;
         repairCost = repairCostBps;
@@ -1438,8 +1451,9 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     }
 
     /// @dev vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd,
-    ///      ramPriceOracle, ramCageMin, ramCageMax). The last three arm the Phase-2 RAM sink pricing at creation
-    ///      (zeros = disarmed; the Guardian can arm/adjust later).
+    ///      ramPriceOracle, ramCageMin, ramCageMax, ramTreasuryWallet). Fields 6-8 arm the Phase-2 RAM sink
+    ///      pricing at creation (zeros = disarmed; the Guardian can arm/adjust later); field 9 is the dedicated
+    ///      treasury wallet receiving the 15% share of RAM sinks (required non-zero, immutable per vault).
     function newVault(address taxToken, address, address creator, bytes calldata vaultData)
         external
         override
@@ -1455,8 +1469,9 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
             uint256 seasonEnd,
             address ramPriceOracle,
             uint256 ramCageMin,
-            uint256 ramCageMax
-        ) = abi.decode(vaultData, (address, address, address, uint256, uint256, address, uint256, uint256));
+            uint256 ramCageMax,
+            address ramTreasuryWallet
+        ) = abi.decode(vaultData, (address, address, address, uint256, uint256, address, uint256, uint256, address));
 
         vault = address(
             new BeaconProxy(
@@ -1472,7 +1487,8 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
                         seasonEnd,
                         ramPriceOracle,
                         ramCageMin,
-                        ramCageMax
+                        ramCageMax,
+                        ramTreasuryWallet
                     )
                 )
             )
@@ -1540,7 +1556,7 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
         schema.description =
             "Launch a RAM Mining Vault. Users buy BNB rig contracts to earn tokenized NVIDIA, acquired from keepers at the Chainlink oracle price plus a small clamped premium and funded by the RAM token's real trading fees, shared by mining power. Provide the reward token (NVDAB), the NVDA/USD and BNB/USD Chainlink feeds, the Micro rig base price, and the season end.";
-        schema.fields = new FieldDescriptor[](8);
+        schema.fields = new FieldDescriptor[](9);
         schema.fields[0] = FieldDescriptor("rewardToken", "address", "Tokenized NVIDIA reward token (NVDAB)", 0);
         schema.fields[1] = FieldDescriptor("rewardPriceFeed", "address", "Chainlink NVDA/USD price feed (8 dec)", 0);
         schema.fields[2] = FieldDescriptor("bnbPriceFeed", "address", "Chainlink BNB/USD price feed (8 dec)", 0);
@@ -1549,6 +1565,7 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
         schema.fields[5] = FieldDescriptor("ramPriceOracle", "address", "RAM price oracle (0 = RAM sinks disarmed)", 0);
         schema.fields[6] = FieldDescriptor("ramCageMin", "uint256", "RAM price cage floor, BNB wei per 1e18 RAM", 18);
         schema.fields[7] = FieldDescriptor("ramCageMax", "uint256", "RAM price cage ceiling, BNB wei per 1e18 RAM", 18);
+        schema.fields[8] = FieldDescriptor("ramTreasuryWallet", "address", "Treasury wallet for the 15% RAM sink share", 0);
         schema.isArray = false;
     }
 }

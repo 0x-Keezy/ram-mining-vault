@@ -54,7 +54,8 @@ contract RamMiningVaultForkTest is Test {
             block.timestamp + 120 days,
             address(0),
             uint256(0),
-            uint256(0)
+            uint256(0),
+            address(0x7E57)
         );
         vm.prank(BNB_MAINNET_VAULT_PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));

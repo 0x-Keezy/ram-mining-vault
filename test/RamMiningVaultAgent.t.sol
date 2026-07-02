@@ -62,6 +62,7 @@ contract MockTriggerService {
 contract RamMiningVaultAgentTest is Test {
     address constant BNB_TESTNET_VAULT_PORTAL = 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f;
     address constant GUARDIAN = 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950;
+    address constant TREASURY = address(0x7E57);
     address constant RAM_TOKEN = address(0x4A11);
 
     address alice = address(0xA11CE);
@@ -88,7 +89,7 @@ contract RamMiningVaultAgentTest is Test {
 
         uint256 seasonEnd = block.timestamp + 60 days;
         bytes memory vaultData =
-            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0);
+            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0, TREASURY);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
 

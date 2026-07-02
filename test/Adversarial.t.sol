@@ -98,7 +98,7 @@ contract AdversarialTest is Test {
         oracle.set(RAM_BNB_PRICE, true);
         bytes memory vd = abi.encode(
             address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd,
-            address(oracle), CAGE_MIN, CAGE_MAX
+            address(oracle), CAGE_MIN, CAGE_MAX, address(0x7E57)
         );
         vm.prank(PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(address(ram), address(0), DEV, vd)));

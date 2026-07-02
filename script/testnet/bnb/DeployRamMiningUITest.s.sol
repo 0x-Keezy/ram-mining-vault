@@ -52,7 +52,8 @@ contract DeployRamMiningUITest is Script {
                     seasonEnd,
                     address(ramOracle),
                     ramBnbPrice / 2,
-                    ramBnbPrice * 2
+                    ramBnbPrice * 2,
+                    DEPLOYER // test treasury wallet: the deployer itself (production uses the dedicated treasury)
                 )
             )
         );

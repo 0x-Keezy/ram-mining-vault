@@ -74,6 +74,7 @@ contract RamMiningVaultPhase2Test is Test {
     address constant GUARDIAN = 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950;
     address constant DEV = 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1;
     address constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    address constant TREASURY = address(0x7E57); // dedicated 15%-share treasury wallet
 
     uint256 constant RAM_BNB_PRICE = 2e12; // 1 RAM = 0.000002 BNB
     uint256 constant CAGE_MIN = 1e12;
@@ -108,7 +109,7 @@ contract RamMiningVaultPhase2Test is Test {
         oracle.set(RAM_BNB_PRICE, true);
         bytes memory vd = abi.encode(
             address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd,
-            address(oracle), CAGE_MIN, CAGE_MAX
+            address(oracle), CAGE_MIN, CAGE_MAX, TREASURY
         );
         vm.prank(PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(address(ram), address(0), DEV, vd)));
@@ -154,11 +155,12 @@ contract RamMiningVaultPhase2Test is Test {
         assertEq(ram.balanceOf(alice), aliceRamBefore - units);
         uint256 burned = (units * 8500) / 10000;
         assertEq(ram.balanceOf(DEAD), burned);
-        assertEq(ram.balanceOf(address(vault)), units - burned);
-        (uint256 paid, uint256 burnedStat, uint256 treasury,,,,) = vault.getRamEconomyStats();
+        assertEq(ram.balanceOf(TREASURY), units - burned); // 15% paid out to the dedicated treasury wallet
+        assertEq(ram.balanceOf(address(vault)), 0); // nothing retained in the vault
+        (uint256 paid, uint256 burnedStat, uint256 treasuryPaid,,,,) = vault.getRamEconomyStats();
         assertEq(paid, units);
         assertEq(burnedStat, burned);
-        assertEq(treasury, units - burned);
+        assertEq(treasuryPaid, units - burned);
         assertEq(vault.totalNativePaid(), basePrice); // BNB stat untouched by the RAM path
     }
 
