@@ -90,6 +90,32 @@ contract MockPriceFeed {
     }
 }
 
+/// @dev Mock IRamPriceOracle: settable price (BNB wei per 1e18 RAM) + trust flag + revert toggle.
+contract MockRamOracle {
+    uint256 public price;
+    bool public trusted;
+    bool public revertCalls;
+
+    function set(uint256 p, bool t) external {
+        price = p;
+        trusted = t;
+    }
+
+    function setRevert(bool v) external {
+        revertCalls = v;
+    }
+
+    function pokeAndGetPrice(address) external view returns (uint256, bool) {
+        require(!revertCalls, "oracle down");
+        return (price, trusted);
+    }
+
+    function getPrice(address) external view returns (uint256, bool) {
+        require(!revertCalls, "oracle down");
+        return (price, trusted);
+    }
+}
+
 /// @dev Buyer contract whose receive() reverts — used to test the safe-refund path.
 contract RevertingBuyer {
     function buy(RamMiningVaultUpgradeable v, uint256 plan) external payable {
@@ -167,6 +193,8 @@ contract RamMiningVaultTest is Test {
     address keeper = address(0xCAFE);
 
     MockRewardToken reward;
+    MockRewardToken ram; // the RAM tax token (Phase-2 sink currency)
+    MockRamOracle ramOracle;
     MockPriceFeed nvdaFeed;
     MockPriceFeed bnbFeed;
     RamMiningBeaconFactory factory;
@@ -175,10 +203,15 @@ contract RamMiningVaultTest is Test {
     uint256 basePrice = 0.001 ether;
     uint256 seasonEnd;
 
+    // RAM priced at 2e12 wei BNB per 1e18 RAM (1 RAM = 0.000002 BNB); cage [1e12, 4e12] around it
+    uint256 constant RAM_BNB_PRICE = 2e12;
+
     function setUp() public {
         vm.chainId(97);
         vm.warp(10 days); // start on a clean bucket boundary, away from bucket 0
         reward = new MockRewardToken(18);
+        ram = new MockRewardToken(18);
+        ramOracle = new MockRamOracle();
         nvdaFeed = new MockPriceFeed(8, NVDA_USD);
         bnbFeed = new MockPriceFeed(8, BNB_USD);
         factory = new RamMiningBeaconFactory();
@@ -188,13 +221,26 @@ contract RamMiningVaultTest is Test {
             abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
 
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
-        address vaultAddress = factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData);
+        address vaultAddress = factory.newVault(address(ram), address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData);
         vault = RamMiningVaultUpgradeable(payable(vaultAddress));
+
+        // Phase-2: arm the RAM sink pricing (oracle + cage) — rigs #2+/repair/upgrade pay RAM
+        ramOracle.set(RAM_BNB_PRICE, true);
+        vm.startPrank(GUARDIAN);
+        vault.setRamPriceOracle(address(ramOracle));
+        vault.setRamPriceCage(RAM_BNB_PRICE / 2, RAM_BNB_PRICE * 2);
+        vm.stopPrank();
 
         vm.deal(alice, 100 ether);
         vm.deal(bob, 100 ether);
         reward.mint(address(this), 10_000_000 ether); // for donateReward injections
         reward.approve(address(vault), type(uint256).max);
+        ram.mint(alice, 1e27);
+        ram.mint(bob, 1e27);
+        vm.prank(alice);
+        ram.approve(address(vault), type(uint256).max);
+        vm.prank(bob);
+        ram.approve(address(vault), type(uint256).max);
     }
 
     // ── helpers ─────────────────────────────────────────────────────────
@@ -237,6 +283,12 @@ contract RamMiningVaultTest is Test {
         (uint256 price,,,) = vault.getPlan(plan);
         vm.prank(who);
         vault.buyMiningContract{value: price}(plan);
+    }
+
+    /// @dev Phase-2: buy a growth rig (#2+) paying RAM (no BNB attached).
+    function _buyRam(address who, uint256 plan) internal {
+        vm.prank(who);
+        vault.buyMiningContract(plan);
     }
 
     /// @dev keeper sells `amount` reward into the vault; vault must hold enough BNB.
@@ -289,23 +341,15 @@ contract RamMiningVaultTest is Test {
     }
 
     function testVaultSchema() public view {
+        // v3 TEST BUILD: schema intentionally minimal (bespoke UI in use; Flap Step 2 recipe).
+        // Restoring a full schema for production is a P4 decision with Flap.
         VaultUISchema memory ui = vault.vaultUISchema();
         assertEq(ui.vaultType, "RamMiningVault");
-        assertEq(ui.methods.length, 9);
-        assertEq(ui.methods[4].name, "buyMiningContract");
-        assertTrue(ui.methods[4].isWriteMethod);
-        assertEq(ui.methods[4].inputs[1].fieldType, "msg.value");
-        assertEq(ui.methods[5].name, "claimRewards");
-        assertTrue(ui.methods[5].isWriteMethod);
-        assertEq(ui.methods[6].name, "quoteRWAToVault");
-        assertEq(ui.methods[7].name, "sellRWAToVault");
-        assertTrue(ui.methods[7].isWriteMethod);
-        assertEq(ui.methods[7].approvals[0].tokenType, "rewardToken");
-        assertEq(ui.methods[8].name, "claimRewardsTo");
+        assertEq(ui.methods.length, 0);
     }
 
     function testInitConfig() public view {
-        assertEq(vault.taxToken(), RAM_TOKEN);
+        assertEq(vault.taxToken(), address(ram));
         assertEq(vault.rewardToken(), address(reward));
         assertEq(vault.rewardPriceFeed(), address(nvdaFeed));
         assertEq(vault.bnbPriceFeed(), address(bnbFeed));
@@ -337,10 +381,10 @@ contract RamMiningVaultTest is Test {
 
     function testProportionalSplit() public {
         _buy(alice, 0); // 10 power
-        _buy(bob, 1); // 40 power -> total 50
-        _inject(50 ether);
+        _buy(bob, 1); // Core: 28 power (v3 concave table) -> total 38
+        _inject(38 ether);
         assertApproxEqAbs(vault.pendingRewards(alice), 10 ether, 1e6);
-        assertApproxEqAbs(vault.pendingRewards(bob), 40 ether, 1e6);
+        assertApproxEqAbs(vault.pendingRewards(bob), 28 ether, 1e6);
     }
 
     function testRewardWhileNoPowerGoesToFirstMiner() public {
@@ -366,18 +410,19 @@ contract RamMiningVaultTest is Test {
     // ── per-rig expiry (lazy buckets) ──────────────────────────────────
 
     function testExpiryFreezesRigButActiveKeepsEarning() public {
-        _buy(alice, 0); // Micro 10 power, 1 day
-        _buy(bob, 1); // Core 40 power, 7 days -> total 50
-        _inject(50 ether);
+        // v3: all rigs live RIG_LIFE (60d) capped by the season, so per-plan early expiry is gone. The freeze
+        // property still holds at season end: pending is frozen at the expiry snapshot and never grows after.
+        _buy(alice, 0); // Micro 10 power, expires with the season (60d)
+        _inject(50 ether); // alice is the only miner -> all 50
+        assertApproxEqAbs(vault.pendingRewards(alice), 50 ether, 1e6);
 
-        vm.warp(block.timestamp + 2 days);
-        _inject(40 ether);
-
-        assertApproxEqAbs(vault.pendingRewards(alice), 10 ether, 1e6);
-        assertApproxEqAbs(vault.pendingRewards(bob), 80 ether, 1e6);
+        vm.warp(seasonEnd + 1); // rig expired with the season
+        _inject(40 ether); // no active power -> buffered as rewardUndistributed, nothing accrues to alice
+        assertApproxEqAbs(vault.pendingRewards(alice), 50 ether, 1e6); // frozen at expiry
 
         (,, uint256 power,,,,) = vault.getVaultMiningStats();
-        assertEq(power, 40);
+        assertEq(power, 0);
+        assertEq(vault.rewardUndistributed(), 40 ether);
     }
 
     // ── keeper / RFQ acquisition ───────────────────────────────────────
@@ -798,13 +843,13 @@ contract RamMiningVaultTest is Test {
     // ── edges / audit-fix coverage ─────────────────────────────────────
 
     function testMaxRigsCap() public {
-        for (uint256 i = 0; i < 16; i++) {
-            _buy(alice, 0);
+        _buy(alice, 0); // rig #1: BNB entry
+        for (uint256 i = 0; i < 15; i++) {
+            _buyRam(alice, 0); // rigs #2..#16: RAM path
         }
-        (uint256 price,,,) = vault.getPlan(0);
         vm.prank(alice);
         vm.expectRevert(TooManyRigs.selector);
-        vault.buyMiningContract{value: price}(0);
+        vault.buyMiningContract(0);
     }
 
     function testRefundExcess() public {
@@ -1086,12 +1131,12 @@ contract RamMiningVaultTest is Test {
     }
 
     function testGetMiningContractView() public {
-        _buy(alice, 2); // Mega: 130 power, 30 days
+        _buy(alice, 2); // Mega: 72 power (v3 concave table), RIG_LIFE
         (uint256 id, uint256 planId, uint256 power,,,, uint256 pending, bool active) =
             vault.getMiningContract(alice, 0);
         assertEq(id, 1);
         assertEq(planId, 2);
-        assertEq(power, 130);
+        assertEq(power, 72);
         assertEq(pending, 0);
         assertTrue(active);
     }

@@ -30,6 +30,18 @@ interface AggregatorV3Interface {
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
+/// @notice Price source for the RAM tax token (Phase-2 sink pricing). Returns the RAM price denominated in BNB
+///         (wei of BNB per 1e18 RAM) plus a trust flag. `trusted == false` means a reliability gate failed
+///         (stale observations / thin pool / immature TWAP / feed down) — the vault then falls back to its
+///         guardian-armed price cage, always erring toward OVER-charging (more RAM burned). The oracle is NEVER
+///         on the claim path and the vault NEVER reverts on oracle failure (degraded mode instead).
+interface IRamPriceOracle {
+    /// @dev State-updating read (records a fresh pair observation, then prices). Called by sink txs.
+    function pokeAndGetPrice(address token) external returns (uint256 priceBnbPerRamE18, bool trusted);
+    /// @dev View read for quotes (no observation recorded).
+    function getPrice(address token) external view returns (uint256 priceBnbPerRamE18, bool trusted);
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 //  Custom errors (v3): file-level, shared by the vault and the factory. Replaces
 //  the audited v2 require-strings 1:1 (semantics unchanged) to free EIP-170
@@ -75,6 +87,13 @@ error NotAuthorized();
 error NotAContract();
 error NoPendingUpgrade();
 error TimelockNotElapsed();
+// --- Phase-2 economy (v3) ---
+error RamPricingNotArmed();
+error RigExpired();
+error InvalidUpgrade();
+error UnexpectedValue();
+error NothingToRepair();
+error NoRamReceived();
 
 /// @title RamMiningVaultUpgradeable
 /// @notice Flap V2 real-yield mining vault for the RAM project — KEEPER/RFQ model (v2).
@@ -125,6 +144,21 @@ contract RamMiningVaultUpgradeable is
 
     // --- keeper egress safety ---
     uint256 public constant WINDOW = 1 days; // fixed/tumbling rate-limit window for BNB egress (see _consumeWindow)
+
+    // --- Phase-2 economy (v3): wear + RAM sinks ---
+    /// @dev Wear is PHYSICS (time-only), snapshot at mint, NEVER derived from dollars earned (economy spec §5).
+    ///      It is implemented as PARTIAL SUB-EXPIRATIONS on the audited bucket machinery: at buy time the rig's
+    ///      deterministic wear steps are registered in `powerExpiringAtBucket` exactly like the audited full-expiry
+    ///      path, so `_settleExpiries` (UNCHANGED) settles them and freezes the accumulator at each step bucket.
+    uint256 public constant WEAR_EPOCH = 3 days; // one wear step every 3 days
+    uint256 public constant WEAR_KEEP_BPS = 9500; // each step keeps 95% of the current level (d = 0.05)
+    uint256 public constant WEAR_FLOOR_BPS = 4700; // effective power never decays below 47% of the plan power
+    uint256 public constant RIG_LIFE = 60 days; // hard rig lifetime (repairs/upgrades NEVER extend it)
+    uint256 public constant RAM_BURN_BPS = 8500; // 85% of every RAM sink payment is burned…
+    address public constant RAM_BURN_ADDR = 0x000000000000000000000000000000000000dEaD; // …to the dead address
+    uint256 public constant REPAIR_AGE_PENALTY_BPS = 3000; // repair restore-cap decays linearly to −30% over RIG_LIFE
+    uint256 public constant MIN_REPAIR_COST_BPS = 2500; // guardian-tunable repair cost, hard-bounded [25%, 75%]
+    uint256 public constant MAX_REPAIR_COST_BPS = 7500; //   of the rig's plan price
 
     // --- config (set at initialize) ---
     address public taxToken; // RAM token (fee source; not held by this vault directly)
@@ -179,21 +213,36 @@ contract RamMiningVaultUpgradeable is
     struct Rig {
         uint256 id;
         uint256 planId;
-        uint256 power;
-        uint256 startTime;
+        uint256 power; // start level of the CURRENT wear schedule (plan power at mint; restored level after repair)
+        uint256 startTime; // mint time — anchors RIG_LIFE (never moved by repair/upgrade)
         uint256 endTime;
         uint256 endBucket;
         uint256 rewardDebt; // accRewardPerPower checkpoint for this rig
         uint256 claimed; // reward token already claimed from this rig
         uint256 paidNative;
+        uint256 wearStart; // start of the CURRENT wear schedule (mint, or last repair/upgrade)
+        uint256 accrued; // reward checkpointed at repair/upgrade (claimable, survives rescheduling)
     }
 
     mapping(address => Rig[]) private userRigs;
 
+    // --- Phase-2 economy (v3) state ---
+    mapping(address => bool) public hasEnteredBefore; // first rig per wallet is paid in BNB; all later ones in RAM
+    address public ramPriceOracle; // IRamPriceOracle for the tax token (guardian-set; RAM sinks disabled until set)
+    uint256 public ramPriceCageMin; // BNB-per-RAM floor (18 dec): degraded-mode price + lower clamp. 0 = not armed
+    uint256 public ramPriceCageMax; // BNB-per-RAM ceiling (18 dec): upper clamp on the trusted market read
+    uint256 public repairCostBps; // repair price as bps of the rig's plan price (bounded [2500, 7500])
+    uint256 public ramTreasuryRetained; // 15% share of RAM sink payments retained by the vault (NEVER market-sold)
+    uint256 public totalRamPaid; // lifetime RAM received through sinks
+    uint256 public totalRamBurned; // lifetime RAM burned to RAM_BURN_ADDR
+
     /// @dev Storage gap for safe future upgrades (append-only): when adding new state vars, append them and
     ///      shrink this gap so the beacon-proxy storage layout never collides. v2 is a fresh deployment
     ///      (new beacon implementation), so this reflects the new layout, not an upgrade-in-place of v1.
-    uint256[44] private __gap;
+    ///      v3 appended 8 slots (Phase-2 economy) → gap shrunk 44 → 36. NOTE: the Rig struct gained fields, which
+    ///      is safe ONLY because v3 deploys as a FRESH beacon implementation for NEW vaults (never an in-place
+    ///      upgrade of a live v2 vault's storage).
+    uint256[36] private __gap;
 
     event RigBought(
         address indexed user,
@@ -216,6 +265,15 @@ contract RamMiningVaultUpgradeable is
     event ReasoningRequested(uint256 requestId);
     event LeverApplied(uint256 indexed requestId, uint8 indexed lever);
     event ReasoningRefunded(uint256 indexed requestId);
+    // --- Phase-2 economy (v3) ---
+    event RigBoughtWithRam(address indexed user, uint256 indexed rigId, uint256 ramPaid, uint256 ramBurned);
+    event RigRepaired(address indexed user, uint256 indexed rigId, uint256 ramPaid, uint256 restoredPower);
+    event RigUpgraded(
+        address indexed user, uint256 indexed rigId, uint256 indexed newPlanId, uint256 ramPaid, uint256 newPower
+    );
+    event RamPriceOracleSet(address oracle);
+    event RamPriceCageSet(uint256 cageMin, uint256 cageMax);
+    event RepairCostSet(uint256 repairCostBps);
 
     constructor() {
         _disableInitializers();
@@ -272,6 +330,9 @@ contract RamMiningVaultUpgradeable is
         priceDeviationBps = 500; // ±5% band vs referencePrice once armed (NVDA-appropriate default)
         windowStart = block.timestamp;
         // maxBnbOutPerFill, maxBnbOutPerWindow, referencePrice default to 0 (sells disabled / band off until armed).
+        // Phase-2: RAM sink pricing starts DISARMED (ramPriceOracle/ramPriceCageMin = 0 → rig #2+/repair/upgrade
+        // revert RamPricingNotArmed until the guardian wires the oracle + cage). Rig #1 in BNB always works.
+        repairCostBps = 4000; // 40% of plan price per repair (guardian-tunable within [25%, 75%])
     }
 
     /// @notice Accept native BNB. The RAM tax token's TaxProcessor sends the `market` fee share here, and the
@@ -282,6 +343,10 @@ contract RamMiningVaultUpgradeable is
     //  Buy / Claim
     // ──────────────────────────────────────────────────────────────────────────
 
+    /// @notice Buy a mining rig. Phase-2 two-phase economy: the FIRST rig of a wallet is paid in native BNB
+    ///         (the entry — also the honest per-wallet Sybil limiter); every later rig is paid in the RAM tax
+    ///         token, converted from the plan's BNB price via the RAM price oracle (85% burned / 15% retained).
+    ///         All rigs live RIG_LIFE (60d, capped by season end) and wear down 5% every 3 days to a 47% floor.
     function buyMiningContract(uint256 planId) external payable nonReentrant {
         if (!(planId < PLAN_COUNT)) revert InvalidPlan();
         if (!(block.timestamp < seasonEnd)) revert SeasonEnded();
@@ -290,11 +355,10 @@ contract RamMiningVaultUpgradeable is
         _compact(msg.sender);
         if (!(userRigs[msg.sender].length < MAX_CONTRACTS_PER_USER)) revert TooManyRigs();
 
-        (uint256 priceWei, uint256 power, uint256 duration,) = _plan(planId);
-        if (!(msg.value >= priceWei)) revert InsufficientPayment();
+        (uint256 priceWei, uint256 power,,) = _plan(planId);
 
         uint256 start = block.timestamp;
-        uint256 end = start + duration;
+        uint256 end = start + RIG_LIFE;
         if (end > seasonEnd) {
             end = seasonEnd;
         }
@@ -307,11 +371,22 @@ contract RamMiningVaultUpgradeable is
         // brick for everyone. Reject such rigs: their power must expire in a future, not-yet-settled bucket.
         if (!(endBucket > lastSettledBucket)) revert RigEndsTooSoon();
 
-        // Refund excess BNB before recording state (safe-order; full revert on failure).
-        uint256 refund = msg.value - priceWei;
-        if (refund > 0) {
-            (bool ok,) = msg.sender.call{value: refund}("");
-            if (!(ok)) revert RefundFailed();
+        uint256 ramPaid;
+        if (!hasEnteredBefore[msg.sender]) {
+            // ── entry rig: BNB path (the audited v2 path, unchanged) ──
+            hasEnteredBefore[msg.sender] = true;
+            if (!(msg.value >= priceWei)) revert InsufficientPayment();
+            // Refund excess BNB before recording state (safe-order; full revert on failure).
+            uint256 refund = msg.value - priceWei;
+            if (refund > 0) {
+                (bool ok,) = msg.sender.call{value: refund}("");
+                if (!(ok)) revert RefundFailed();
+            }
+            totalNativePaid += priceWei;
+        } else {
+            // ── growth rig: RAM path (Phase-2). No BNB accepted here — the plan price converts to RAM units. ──
+            if (msg.value != 0) revert UnexpectedValue();
+            ramPaid = _chargeRam(priceWei);
         }
 
         lastContractId += 1;
@@ -325,16 +400,22 @@ contract RamMiningVaultUpgradeable is
                 endBucket: endBucket,
                 rewardDebt: accRewardPerPower,
                 claimed: 0,
-                paidNative: priceWei
+                paidNative: ramPaid == 0 ? priceWei : 0,
+                wearStart: start,
+                accrued: 0
             })
         );
 
+        // Register the full wear ladder as partial sub-expirations on the audited bucket machinery: the
+        // registered deltas + the end remainder telescope to exactly `power`, matching totalActivePower.
         totalActivePower += power;
-        powerExpiringAtBucket[endBucket] += power;
+        _applySchedule(power, _floorLevel(planId), start, end, endBucket, true, 0);
         totalContractsSold += 1;
-        totalNativePaid += priceWei;
 
         emit RigBought(msg.sender, lastContractId, planId, power, priceWei, start, end);
+        if (ramPaid > 0) {
+            emit RigBoughtWithRam(msg.sender, lastContractId, ramPaid, (ramPaid * RAM_BURN_BPS) / BPS_DENOM);
+        }
     }
 
     // @dev Claims are NEVER gated by anything — there is no pause anywhere in this vault (Flap's no-pause model:
@@ -355,19 +436,170 @@ contract RamMiningVaultUpgradeable is
         amount = _claim(msg.sender, to);
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    //  Phase-2 economy (v3): repair & upgrade — RAM sinks (85% burn / 15% retained)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// @notice Repair a live rig: pay RAM (85% burned) to reset its wear ladder NOW at a restored level. The
+    ///         restore cap decays linearly with the rig's AGE (100% → 70% of plan power over RIG_LIFE), so old
+    ///         rigs restore less — and the RIG_LIFE wall itself is NEVER extended. Claimable NVDA is untouched.
+    function repairRig(uint256 index) external nonReentrant {
+        _settleExpiries();
+        Rig[] storage rigs = userRigs[msg.sender];
+        if (!(index < rigs.length)) revert BadIndex();
+        Rig storage r = rigs[index];
+        if (!(block.timestamp < r.endTime && block.timestamp / BUCKET < r.endBucket)) revert RigExpired();
+
+        (uint256 planPrice, uint256 planPower,,) = _plan(r.planId);
+        uint256 capBps = BPS_DENOM - ((block.timestamp - r.startTime) * REPAIR_AGE_PENALTY_BPS) / RIG_LIFE;
+        uint256 restored = (planPower * capBps) / BPS_DENOM;
+        uint256 floorLvl = _floorLevel(r.planId);
+        if (restored < floorLvl) restored = floorLvl;
+        if (!(restored > _rigCurrentPower(r))) revert NothingToRepair();
+
+        uint256 ramPaid = _chargeRam((planPrice * repairCostBps) / BPS_DENOM);
+        _reschedule(r, restored, r.planId);
+        emit RigRepaired(msg.sender, r.id, ramPaid, restored);
+    }
+
+    /// @notice Upgrade a live rig to a higher tier: pay the plan-price DIFFERENCE in RAM (85% burned). The rig
+    ///         becomes the new tier at full power with a FRESH wear ladder (new hardware), but its RIG_LIFE wall
+    ///         stays anchored to the ORIGINAL mint — upgrades never extend a rig's life.
+    function upgradeRig(uint256 index, uint256 newPlanId) external nonReentrant {
+        if (!(newPlanId < PLAN_COUNT)) revert InvalidPlan();
+        _settleExpiries();
+        Rig[] storage rigs = userRigs[msg.sender];
+        if (!(index < rigs.length)) revert BadIndex();
+        Rig storage r = rigs[index];
+        if (!(block.timestamp < r.endTime && block.timestamp / BUCKET < r.endBucket)) revert RigExpired();
+        if (!(newPlanId > r.planId)) revert InvalidUpgrade();
+
+        (uint256 oldPrice,,,) = _plan(r.planId);
+        (uint256 newPrice, uint256 newPower,,) = _plan(newPlanId);
+        uint256 ramPaid = _chargeRam(newPrice - oldPrice);
+        _reschedule(r, newPower, newPlanId);
+        emit RigUpgraded(msg.sender, r.id, newPlanId, ramPaid, newPower);
+    }
+
+    /// @dev Charge a BNB-denominated cost in RAM units through the oracle+cage price, split 85% burn / 15%
+    ///      retained treasury (NEVER market-sold). Delta-measured so a taxed/fee-on-transfer path can't corrupt
+    ///      accounting. Reverts only when the RAM pricing is not armed (safe-by-default) or nothing arrives.
+    function _chargeRam(uint256 bnbCost) internal returns (uint256 received) {
+        uint256 price = _cagedRamPrice(true);
+        uint256 units = (bnbCost * 1e18) / price;
+        if (!(units > 0)) revert ZeroAmount();
+
+        IERC20 ram = IERC20(taxToken);
+        uint256 balBefore = ram.balanceOf(address(this));
+        ram.safeTransferFrom(msg.sender, address(this), units);
+        received = ram.balanceOf(address(this)) - balBefore;
+        if (!(received > 0)) revert NoRamReceived();
+
+        uint256 burnAmt = (received * RAM_BURN_BPS) / BPS_DENOM;
+        if (burnAmt > 0) {
+            ram.safeTransfer(RAM_BURN_ADDR, burnAmt);
+        }
+        ramTreasuryRetained += received - burnAmt;
+        totalRamPaid += received;
+        totalRamBurned += burnAmt;
+    }
+
+    /// @dev Resolve the RAM price (BNB wei per 1e18 RAM) through the oracle, then the guardian cage — the
+    ///      judge-mandated fail-safe shape: the market read is used ONLY when the oracle reports it trusted;
+    ///      any failure (untrusted / zero / oracle reverting) degrades to the cage FLOOR, which assumes the
+    ///      CHEAPEST RAM and therefore charges the MOST units (over-charging is the safe direction for a burn
+    ///      sink). A trusted read is clamped into [cageMin, cageMax]. Never on the claim path.
+    function _cagedRamPrice(bool poke) internal returns (uint256 price) {
+        address oracle = ramPriceOracle;
+        uint256 cageMin = ramPriceCageMin;
+        if (oracle == address(0) || cageMin == 0) revert RamPricingNotArmed();
+        bool trusted;
+        uint256 p;
+        if (poke) {
+            try IRamPriceOracle(oracle).pokeAndGetPrice(taxToken) returns (uint256 p_, bool t_) {
+                (p, trusted) = (p_, t_);
+            } catch {}
+        } else {
+            try IRamPriceOracle(oracle).getPrice(taxToken) returns (uint256 p_, bool t_) {
+                (p, trusted) = (p_, t_);
+            } catch {}
+        }
+        if (!trusted || p == 0) {
+            return cageMin;
+        }
+        uint256 cageMax = ramPriceCageMax;
+        if (p < cageMin) return cageMin;
+        if (p > cageMax) return cageMax;
+        return p;
+    }
+
+    /// @dev View twin of _cagedRamPrice for quoting (view context — cannot poke).
+    function _cagedRamPriceView() internal view returns (uint256 price, bool trusted) {
+        address oracle = ramPriceOracle;
+        uint256 cageMin = ramPriceCageMin;
+        if (oracle == address(0) || cageMin == 0) revert RamPricingNotArmed();
+        uint256 p;
+        try IRamPriceOracle(oracle).getPrice(taxToken) returns (uint256 p_, bool t_) {
+            (p, trusted) = (p_, t_);
+        } catch {}
+        if (!trusted || p == 0) {
+            return (cageMin, false);
+        }
+        uint256 cageMax = ramPriceCageMax;
+        if (p < cageMin) p = cageMin;
+        if (p > cageMax) p = cageMax;
+        return (p, true);
+    }
+
+    /// @notice Quote a rig purchase (rig #2+) in RAM units at the current caged price.
+    function quoteRigInRam(uint256 planId) external view returns (uint256 ramUnits, bool trusted) {
+        (uint256 priceWei,,,) = _plan(planId);
+        uint256 price;
+        (price, trusted) = _cagedRamPriceView();
+        ramUnits = (priceWei * 1e18) / price;
+    }
+
+    /// @notice Quote a repair of `user`'s rig at `index` in RAM units at the current caged price.
+    function quoteRepairInRam(address user, uint256 index) external view returns (uint256 ramUnits, bool trusted) {
+        if (!(index < userRigs[user].length)) revert BadIndex();
+        (uint256 planPrice,,,) = _plan(userRigs[user][index].planId);
+        uint256 price;
+        (price, trusted) = _cagedRamPriceView();
+        ramUnits = (((planPrice * repairCostBps) / BPS_DENOM) * 1e18) / price;
+    }
+
+    /// @notice Quote a tier upgrade of `user`'s rig at `index` to `newPlanId` in RAM units.
+    function quoteUpgradeInRam(address user, uint256 index, uint256 newPlanId)
+        external
+        view
+        returns (uint256 ramUnits, bool trusted)
+    {
+        if (!(index < userRigs[user].length)) revert BadIndex();
+        if (!(newPlanId < PLAN_COUNT)) revert InvalidPlan();
+        uint256 oldPlanId = userRigs[user][index].planId;
+        if (!(newPlanId > oldPlanId)) revert InvalidUpgrade();
+        (uint256 oldPrice,,,) = _plan(oldPlanId);
+        (uint256 newPrice,,,) = _plan(newPlanId);
+        uint256 price;
+        (price, trusted) = _cagedRamPriceView();
+        ramUnits = ((newPrice - oldPrice) * 1e18) / price;
+    }
+
     /// @dev Single accounting+transfer claim path. Effects (rewardDebt/claimed) are mutated BEFORE the one and
     ///      only `safeTransfer` at the end; if that transfer reverts (reward token paused / recipient non-compliant)
     ///      the whole tx rolls back atomically, leaving this miner's pending intact and OTHER miners' accounting
     ///      untouched. No transfers happen inside the rig loop (would open reentrancy). (must-fix #8 alignment.)
+    ///      v3: per-rig owed is the wear-tranche sum (see _rigPending); the debt reset to the CURRENT accumulator
+    ///      zeroes every already-expired tranche (their frozen snapshots are ≤ acc now) and re-bases live ones.
     function _claim(address user, address to) internal returns (uint256 amount) {
         _settleExpiries();
         Rig[] storage rigs = userRigs[user];
         for (uint256 i = 0; i < rigs.length; i++) {
             Rig storage r = rigs[i];
-            uint256 acc = _rigAcc(r);
-            uint256 owed = (r.power * (acc - r.rewardDebt)) / ACC_PRECISION;
+            uint256 owed = _rigPending(r);
             if (owed > 0) {
-                r.rewardDebt = acc;
+                r.rewardDebt = accRewardPerPower;
+                r.accrued = 0;
                 r.claimed += owed;
                 amount += owed;
             }
@@ -569,19 +801,131 @@ contract RamMiningVaultUpgradeable is
         lastSettledBucket = nowBucket;
     }
 
-    /// @dev The accumulator value applicable to a rig: live if still active, frozen snapshot if expired.
-    function _rigAcc(Rig storage r) internal view returns (uint256) {
-        uint256 nowBucket = block.timestamp / BUCKET;
-        if (nowBucket >= r.endBucket) {
-            // Expired. If settlement already passed its bucket, the frozen snapshot is authoritative.
-            // Otherwise no reward could have been distributed since expiry (notifyReward always settles first),
-            // so the current accumulator equals the value at expiry.
-            if (lastSettledBucket >= r.endBucket) {
-                return accSnapshotAtBucket[r.endBucket];
-            }
-            return accRewardPerPower;
+    // ──────────────────────────────────────────────────────────────────────────
+    //  Wear ladder (v3) — partial sub-expirations on the audited bucket machinery
+    // ──────────────────────────────────────────────────────────────────────────
+    //
+    //  A rig's effective power steps down 5% every WEAR_EPOCH (3d) until the 47%-of-plan floor, then holds the
+    //  floor until endTime (RIG_LIFE, season-capped). Every step is REGISTERED in `powerExpiringAtBucket` at buy
+    //  time, so the AUDITED `_settleExpiries` (untouched) both subtracts the step from `totalActivePower` and
+    //  freezes `accSnapshotAtBucket` at that bucket — a wear step is accounting-identical to a partial expiry.
+    //  All four consumers (register, unregister, pending, current-power) walk the SAME canonical ladder loop so
+    //  the per-rig view can never diverge from the aggregate machinery.
+
+    /// @dev The accumulator value applicable at a bucket boundary: the frozen snapshot once settlement passed it,
+    ///      the live accumulator otherwise (no reward can land between expiry and settle — notify settles first).
+    function _accAtBucket(uint256 b) internal view returns (uint256) {
+        if (lastSettledBucket >= b) {
+            return accSnapshotAtBucket[b];
         }
         return accRewardPerPower;
+    }
+
+    /// @dev Effective-power floor for a plan (47% of the plan's mint power).
+    function _floorLevel(uint256 planId) internal view returns (uint256) {
+        (, uint256 planPower,,) = _plan(planId);
+        return (planPower * WEAR_FLOOR_BPS) / BPS_DENOM;
+    }
+
+    /// @dev Register (add=true) or unregister (add=false) a wear ladder in `powerExpiringAtBucket`. The step
+    ///      deltas plus the end remainder telescope to exactly `startLevel`. `skipUpToBucket` skips buckets the
+    ///      settle loop already consumed (used when unregistering a live rig's remaining ladder: the skipped,
+    ///      already-settled steps were deducted from totalActivePower by settle; what remains telescopes to the
+    ///      rig's CURRENT live level).
+    function _applySchedule(
+        uint256 startLevel,
+        uint256 floorLvl,
+        uint256 wearStart,
+        uint256 endTime,
+        uint256 endBucket,
+        bool add,
+        uint256 skipUpToBucket
+    ) internal {
+        uint256 lvl = startLevel;
+        for (uint256 k = 1;; k++) {
+            uint256 t = wearStart + k * WEAR_EPOCH;
+            if (t >= endTime) break;
+            uint256 next = (lvl * WEAR_KEEP_BPS) / BPS_DENOM;
+            if (next < floorLvl) next = floorLvl;
+            if (next == lvl) break;
+            uint256 sb = t / BUCKET;
+            if (sb > skipUpToBucket) {
+                if (add) {
+                    powerExpiringAtBucket[sb] += lvl - next;
+                } else {
+                    powerExpiringAtBucket[sb] -= lvl - next;
+                }
+            }
+            lvl = next;
+        }
+        if (add) {
+            powerExpiringAtBucket[endBucket] += lvl;
+        } else {
+            powerExpiringAtBucket[endBucket] -= lvl;
+        }
+    }
+
+    /// @dev Pending reward of a rig = Σ over ladder tranches of tranche-power × (acc at the tranche's expiry
+    ///      boundary − rig debt), plus the checkpointed `accrued` from reschedules. Expired tranches use their
+    ///      frozen bucket snapshots; live ones the current accumulator — uniformly via _accAtBucket. A tranche
+    ///      whose boundary settled BEFORE the rig's debt checkpoint contributes 0 (snapshot ≤ debt).
+    function _rigPending(Rig storage r) internal view returns (uint256 owed) {
+        uint256 debt = r.rewardDebt;
+        uint256 weighted;
+        uint256 lvl = r.power;
+        uint256 floorLvl = _floorLevel(r.planId);
+        for (uint256 k = 1;; k++) {
+            uint256 t = r.wearStart + k * WEAR_EPOCH;
+            if (t >= r.endTime) break;
+            uint256 next = (lvl * WEAR_KEEP_BPS) / BPS_DENOM;
+            if (next < floorLvl) next = floorLvl;
+            if (next == lvl) break;
+            uint256 accK = _accAtBucket(t / BUCKET);
+            if (accK > debt) {
+                weighted += (lvl - next) * (accK - debt);
+            }
+            lvl = next;
+        }
+        uint256 accEnd = _accAtBucket(r.endBucket);
+        if (accEnd > debt) {
+            weighted += lvl * (accEnd - debt);
+        }
+        owed = weighted / ACC_PRECISION + r.accrued;
+    }
+
+    /// @dev Current effective (wear-decayed) power of a rig; 0 once expired.
+    function _rigCurrentPower(Rig storage r) internal view returns (uint256 lvl) {
+        uint256 nowBucket = block.timestamp / BUCKET;
+        if (nowBucket >= r.endBucket) return 0;
+        lvl = r.power;
+        uint256 floorLvl = _floorLevel(r.planId);
+        for (uint256 k = 1;; k++) {
+            uint256 t = r.wearStart + k * WEAR_EPOCH;
+            if (t >= r.endTime) break;
+            uint256 sb = t / BUCKET;
+            if (nowBucket < sb) break;
+            uint256 next = (lvl * WEAR_KEEP_BPS) / BPS_DENOM;
+            if (next < floorLvl) next = floorLvl;
+            if (next == lvl) break;
+            lvl = next;
+        }
+    }
+
+    /// @dev Reschedule a live rig's ladder (repair/upgrade): checkpoint its pending into `accrued`, swap the
+    ///      not-yet-settled remainder of the old ladder for a fresh one starting at `newLevel` NOW, and adjust
+    ///      `totalActivePower` by the live-level delta. `endTime`/`endBucket` are NEVER touched (RIG_LIFE is a
+    ///      hard wall anchored at mint). Caller must have settled expiries and verified the rig is alive.
+    function _reschedule(Rig storage r, uint256 newLevel, uint256 newPlanId) internal {
+        uint256 pending = _rigPending(r);
+        uint256 live = _rigCurrentPower(r);
+        _applySchedule(r.power, _floorLevel(r.planId), r.wearStart, r.endTime, r.endBucket, false, lastSettledBucket);
+        r.accrued = pending;
+        r.rewardDebt = accRewardPerPower;
+        r.planId = newPlanId;
+        r.power = newLevel;
+        r.wearStart = block.timestamp;
+        _applySchedule(newLevel, _floorLevel(newPlanId), block.timestamp, r.endTime, r.endBucket, true, 0);
+        totalActivePower = totalActivePower + newLevel - live;
     }
 
     /// @dev Removes fully-settled expired rigs (no pending) via swap-and-pop to keep the active set bounded.
@@ -591,9 +935,7 @@ contract RamMiningVaultUpgradeable is
         while (i < rigs.length) {
             Rig storage r = rigs[i];
             bool expired = block.timestamp / BUCKET >= r.endBucket;
-            uint256 acc = _rigAcc(r);
-            uint256 owed = (r.power * (acc - r.rewardDebt)) / ACC_PRECISION;
-            if (expired && owed == 0) {
+            if (expired && _rigPending(r) == 0) {
                 rigs[i] = rigs[rigs.length - 1];
                 rigs.pop();
             } else {
@@ -609,9 +951,7 @@ contract RamMiningVaultUpgradeable is
     function pendingRewards(address user) public view returns (uint256 amount) {
         Rig[] storage rigs = userRigs[user];
         for (uint256 i = 0; i < rigs.length; i++) {
-            Rig storage r = rigs[i];
-            uint256 acc = _rigAcc(r);
-            amount += (r.power * (acc - r.rewardDebt)) / ACC_PRECISION;
+            amount += _rigPending(rigs[i]);
         }
     }
 
@@ -637,13 +977,58 @@ contract RamMiningVaultUpgradeable is
         Rig storage r = userRigs[user][index];
         rigId = r.id;
         planId = r.planId;
-        power = r.power;
+        power = _rigCurrentPower(r); // v3: live wear-decayed power (0 once expired)
         startTime = r.startTime;
         endTime = r.endTime;
         claimed = r.claimed;
-        uint256 acc = _rigAcc(r);
-        pending = (r.power * (acc - r.rewardDebt)) / ACC_PRECISION;
+        pending = _rigPending(r);
         active = block.timestamp / BUCKET < r.endBucket;
+    }
+
+    /// @notice v3 wear detail for a rig: schedule level, live effective power, floor, and life bounds.
+    function getRigWear(address user, uint256 index)
+        external
+        view
+        returns (
+            uint256 scheduleLevel,
+            uint256 currentPower,
+            uint256 floorPower,
+            uint256 wearStartedAt,
+            uint256 lifeEndsAt,
+            uint256 accruedReward
+        )
+    {
+        if (!(index < userRigs[user].length)) revert BadIndex();
+        Rig storage r = userRigs[user][index];
+        scheduleLevel = r.power;
+        currentPower = _rigCurrentPower(r);
+        floorPower = _floorLevel(r.planId);
+        wearStartedAt = r.wearStart;
+        lifeEndsAt = r.endTime;
+        accruedReward = r.accrued;
+    }
+
+    /// @notice v3 Phase-2 economy stats (RAM sink flows + config).
+    function getRamEconomyStats()
+        external
+        view
+        returns (
+            uint256 ramPaidLifetime,
+            uint256 ramBurnedLifetime,
+            uint256 ramTreasury,
+            uint256 cageMin,
+            uint256 cageMax,
+            uint256 repairCost,
+            address oracle
+        )
+    {
+        ramPaidLifetime = totalRamPaid;
+        ramBurnedLifetime = totalRamBurned;
+        ramTreasury = ramTreasuryRetained;
+        cageMin = ramPriceCageMin;
+        cageMax = ramPriceCageMax;
+        repairCost = repairCostBps;
+        oracle = ramPriceOracle;
     }
 
     function getPlan(uint256 planId)
@@ -693,11 +1078,8 @@ contract RamMiningVaultUpgradeable is
         for (uint256 i = 0; i < rigs.length; i++) {
             Rig storage r = rigs[i];
             lifetimeClaimed += r.claimed;
-            if (block.timestamp / BUCKET < r.endBucket) {
-                activePower += r.power;
-            }
-            uint256 acc = _rigAcc(r);
-            claimableReward += (r.power * (acc - r.rewardDebt)) / ACC_PRECISION;
+            activePower += _rigCurrentPower(r); // 0 once expired; wear-decayed while live
+            claimableReward += _rigPending(r);
         }
         sharePerMille = totalActivePower == 0 ? 0 : (activePower * 1000) / totalActivePower;
     }
@@ -709,103 +1091,16 @@ contract RamMiningVaultUpgradeable is
         return "RAM Mining Vault: rigs are mining. Rewards are tokenized NVIDIA bought with real RAM trading fees and shared by mining power.";
     }
 
+    /// @dev v3 TEST BUILD (Flap Post-Audit Step 2 recipe): the auto-generated-UI schema is intentionally
+    ///      MINIMAL — RAM ships a bespoke UI artifact, so these schemas no longer feed any UI. Flap explicitly
+    ///      blessed ignoring the schema findings once a bespoke UI is used (audit v2), and their Step 2 testing
+    ///      recipe is to strip description()/vaultUISchema() for the simplified test factory. Restoring a full
+    ///      schema for production is a P4 decision with Flap. This also frees ~4 KB of EIP-170 headroom that the
+    ///      Phase-2 economy occupies.
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
         schema.vaultType = "RamMiningVault";
-        schema.description =
-            "Mine tokenized NVIDIA with RAM. Buy a rig with BNB to gain mining power; the vault acquires tokenized NVIDIA from keepers at the Chainlink oracle price plus a small clamped premium (funded by real trading fees) and distributes it pro-rata to your power. No buyback & burn.";
-        schema.methods = new VaultMethodSchema[](9);
-
-        schema.methods[0].name = "getVaultMiningStats";
-        schema.methods[0].description =
-            "Mining Terminal: NVDA reward balance, BNB treasury, total power, rigs sold, NVDA distributed, season end, accumulator.";
-        schema.methods[0].inputs = new FieldDescriptor[](0);
-        schema.methods[0].outputs = new FieldDescriptor[](7);
-        schema.methods[0].outputs[0] = FieldDescriptor("rewardBalance", "uint256", "NVDA Reward Balance", 18);
-        schema.methods[0].outputs[1] = FieldDescriptor("bnbTreasury", "uint256", "BNB Treasury", 18);
-        schema.methods[0].outputs[2] = FieldDescriptor("totalMiningPower", "uint256", "Total Mining Power", 0);
-        schema.methods[0].outputs[3] = FieldDescriptor("rigsSold", "uint256", "Rigs Sold", 0);
-        schema.methods[0].outputs[4] = FieldDescriptor("nvdaDistributed", "uint256", "NVDA Distributed", 18);
-        schema.methods[0].outputs[5] = FieldDescriptor("seasonEnds", "time", "Season Ends", 0);
-        schema.methods[0].outputs[6] = FieldDescriptor("accPerPower", "uint256", "Acc Reward / Power", 0);
-        schema.methods[0].approvals = new ApproveAction[](0);
-
-        schema.methods[1].name = "getUserMinerStats";
-        schema.methods[1].description = "My Miner: rigs, active power, NVDA claimed, claimable NVDA, share per-mille.";
-        schema.methods[1].inputs = new FieldDescriptor[](1);
-        schema.methods[1].inputs[0] = FieldDescriptor("user", "address", "Miner wallet address", 0);
-        schema.methods[1].outputs = new FieldDescriptor[](5);
-        schema.methods[1].outputs[0] = FieldDescriptor("myRigs", "uint256", "My Rigs", 0);
-        schema.methods[1].outputs[1] = FieldDescriptor("myPower", "uint256", "My Power", 0);
-        schema.methods[1].outputs[2] = FieldDescriptor("alreadyClaimed", "uint256", "NVDA Claimed", 18);
-        schema.methods[1].outputs[3] = FieldDescriptor("claimableNVDA", "uint256", "Claimable NVDA", 18);
-        schema.methods[1].outputs[4] = FieldDescriptor("sharePerMille", "uint256", "Share (per-mille)", 0);
-        schema.methods[1].approvals = new ApproveAction[](0);
-
-        schema.methods[2].name = "pendingRewards";
-        schema.methods[2].description = "Quick claimable NVDA check for any miner wallet.";
-        schema.methods[2].inputs = new FieldDescriptor[](1);
-        schema.methods[2].inputs[0] = FieldDescriptor("user", "address", "Miner wallet address", 0);
-        schema.methods[2].outputs = new FieldDescriptor[](1);
-        schema.methods[2].outputs[0] = FieldDescriptor("claimableNVDA", "uint256", "Claimable NVDA", 18);
-        schema.methods[2].approvals = new ApproveAction[](0);
-
-        schema.methods[3].name = "getPlan";
-        schema.methods[3].description = "Rig Shop preview. Plan IDs: 0 Micro, 1 Core, 2 Mega, 3 Hyper.";
-        schema.methods[3].inputs = new FieldDescriptor[](1);
-        schema.methods[3].inputs[0] = FieldDescriptor("planId", "uint256", "Plan ID: 0, 1, 2, or 3", 0);
-        schema.methods[3].outputs = new FieldDescriptor[](4);
-        schema.methods[3].outputs[0] = FieldDescriptor("rigPrice", "uint256", "Rig Price", 18);
-        schema.methods[3].outputs[1] = FieldDescriptor("miningPower", "uint256", "Mining Power", 0);
-        schema.methods[3].outputs[2] = FieldDescriptor("duration", "uint256", "Duration", 0);
-        schema.methods[3].outputs[3] = FieldDescriptor("rigName", "string", "Rig Name", 0);
-        schema.methods[3].approvals = new ApproveAction[](0);
-
-        schema.methods[4].name = "buyMiningContract";
-        schema.methods[4].description = "Buy a mining rig with BNB. Plan IDs: 0 Micro, 1 Core, 2 Mega, 3 Hyper. Extra BNB is refunded.";
-        schema.methods[4].inputs = new FieldDescriptor[](2);
-        schema.methods[4].inputs[0] = FieldDescriptor("planId", "uint256", "Plan ID: 0, 1, 2, or 3", 0);
-        schema.methods[4].inputs[1] = FieldDescriptor("amount", "msg.value", "BNB to pay for the selected rig", 18);
-        schema.methods[4].outputs = new FieldDescriptor[](0);
-        schema.methods[4].approvals = new ApproveAction[](0);
-        schema.methods[4].isWriteMethod = true;
-
-        schema.methods[5].name = "claimRewards";
-        schema.methods[5].description = "Claim your accumulated tokenized NVIDIA rewards.";
-        schema.methods[5].inputs = new FieldDescriptor[](0);
-        schema.methods[5].outputs = new FieldDescriptor[](0);
-        schema.methods[5].approvals = new ApproveAction[](0);
-        schema.methods[5].isWriteMethod = true;
-
-        schema.methods[6].name = "quoteRWAToVault";
-        schema.methods[6].description =
-            "Keeper RFQ quote: BNB the vault will pay for a given amount of the RWA reward token at the oracle price plus premium.";
-        schema.methods[6].inputs = new FieldDescriptor[](1);
-        schema.methods[6].inputs[0] = FieldDescriptor("rwaAmount", "uint256", "RWA reward token amount to sell", 18);
-        schema.methods[6].outputs = new FieldDescriptor[](1);
-        schema.methods[6].outputs[0] = FieldDescriptor("bnbOwed", "uint256", "BNB the vault will pay", 18);
-        schema.methods[6].approvals = new ApproveAction[](0);
-
-        schema.methods[7].name = "sellRWAToVault";
-        schema.methods[7].description =
-            "Keeper RFQ fill: sell the RWA reward token into the vault for BNB at the oracle price plus premium. Set minBnbOut for slippage protection.";
-        schema.methods[7].inputs = new FieldDescriptor[](2);
-        schema.methods[7].inputs[0] = FieldDescriptor("rwaAmount", "uint256", "RWA reward token amount to sell", 18);
-        schema.methods[7].inputs[1] = FieldDescriptor("minBnbOut", "uint256", "Minimum BNB to accept (slippage)", 18);
-        schema.methods[7].outputs = new FieldDescriptor[](1);
-        schema.methods[7].outputs[0] = FieldDescriptor("bnbOut", "uint256", "BNB paid to the keeper", 18);
-        schema.methods[7].approvals = new ApproveAction[](1);
-        // UI: call vault.rewardToken() then token.approve(vault, rwaAmount) before the fill.
-        schema.methods[7].approvals[0] = ApproveAction("rewardToken", "rwaAmount");
-        schema.methods[7].isWriteMethod = true;
-
-        schema.methods[8].name = "claimRewardsTo";
-        schema.methods[8].description =
-            "Claim your accumulated tokenized NVIDIA rewards to a different recipient address.";
-        schema.methods[8].inputs = new FieldDescriptor[](1);
-        schema.methods[8].inputs[0] = FieldDescriptor("to", "address", "Recipient of the claimed rewards", 0);
-        schema.methods[8].outputs = new FieldDescriptor[](0);
-        schema.methods[8].approvals = new ApproveAction[](0);
-        schema.methods[8].isWriteMethod = true;
+        schema.description = "RAM real-yield mining vault (bespoke UI artifact; schema intentionally minimal).";
+        schema.methods = new VaultMethodSchema[](0);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -902,6 +1197,32 @@ contract RamMiningVaultUpgradeable is
         if (!(bps >= MIN_PREMIUM_BPS && bps <= MAX_PREMIUM_BPS)) revert PremiumOutOfRange();
         keeperPremiumBps = bps;
         emit KeeperPremiumSet(bps);
+    }
+
+    // ── Phase-2 (v3): RAM sink pricing config — same safe-by-default shape as the keeper guards ──
+
+    /// @notice Wire/replace the RAM price oracle. RAM sinks stay disabled until BOTH the oracle and the cage
+    ///         are armed. Setting address(0) disarms the RAM path (rig #1 in BNB and claims are unaffected).
+    function setRamPriceOracle(address oracle) external onlyGuardian {
+        ramPriceOracle = oracle;
+        emit RamPriceOracleSet(oracle);
+    }
+
+    /// @notice Arm/move the RAM price cage (BNB wei per 1e18 RAM). `cageMin` is BOTH the lower clamp on the
+    ///         market read and the degraded-mode price (cheapest RAM assumed → most units charged → safe for a
+    ///         burn sink). `cageMin = 0` disarms the RAM path entirely.
+    function setRamPriceCage(uint256 cageMin, uint256 cageMax) external onlyGuardian {
+        if (!(cageMin <= cageMax)) revert BadConfig();
+        ramPriceCageMin = cageMin;
+        ramPriceCageMax = cageMax;
+        emit RamPriceCageSet(cageMin, cageMax);
+    }
+
+    /// @notice Tune the repair cost (bps of the rig's plan price), hard-bounded to [25%, 75%].
+    function setRepairCost(uint256 bps) external onlyGuardian {
+        if (!(bps >= MIN_REPAIR_COST_BPS && bps <= MAX_REPAIR_COST_BPS)) revert BadConfig();
+        repairCostBps = bps;
+        emit RepairCostSet(bps);
     }
 
     // NOTE: there is intentionally NO emergencyRescueReward / pauseManager and NO acquisition pause. The reward
@@ -1059,6 +1380,13 @@ contract RamMiningVaultUpgradeable is
     //  Plans
     // ──────────────────────────────────────────────────────────────────────────
 
+    /// @dev v3 tier table. All tiers live RIG_LIFE (60d, season-capped) — the wear ladder, not the duration, is
+    ///      what differentiates lived value. Powers follow the approved α=0.95 concave curve applied per plan
+    ///      (power ∝ spend^0.95 at spend multiples 1/3/8/20 → 10/28/72/172): power-per-BNB DECREASES with tier
+    ///      (1.00 → 0.93 → 0.90 → 0.86 ×base), the anti-BigCoin invariant. (Per-WALLET cumulative concavity is
+    ///      v3-complete scope, via beacon upgrade.) This supersedes the audited v2 table (10/40/130/420 with
+    ///      1d/7d/30d/90d durations), whose integrated whale-skew was the disclosed F2 finding — the v3 table
+    ///      flattens that skew from ~189× to ~0.86× (mildly anti-whale).
     function _plan(uint256 planId)
         internal
         view
@@ -1066,13 +1394,13 @@ contract RamMiningVaultUpgradeable is
     {
         if (!(planId < PLAN_COUNT)) revert InvalidPlan();
         if (planId == 0) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei, 10, 1 days, "Micro Rig");
+            (priceWei, power, durationSeconds, name) = (basePriceWei, 10, RIG_LIFE, "Micro Rig");
         } else if (planId == 1) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 3, 40, 7 days, "Core Rig");
+            (priceWei, power, durationSeconds, name) = (basePriceWei * 3, 28, RIG_LIFE, "Core Rig");
         } else if (planId == 2) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 8, 130, 30 days, "Mega Rig");
+            (priceWei, power, durationSeconds, name) = (basePriceWei * 8, 72, RIG_LIFE, "Mega Rig");
         } else {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 20, 420, 90 days, "Hyper Rig");
+            (priceWei, power, durationSeconds, name) = (basePriceWei * 20, 172, RIG_LIFE, "Hyper Rig");
         }
         if (!(priceWei > 0 && power > 0 && durationSeconds > 0)) revert BadPlanParams();
     }
