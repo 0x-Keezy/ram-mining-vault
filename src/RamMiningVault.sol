@@ -285,7 +285,10 @@ contract RamMiningVaultUpgradeable is
         address _rewardPriceFeed,
         address _bnbPriceFeed,
         uint256 _basePriceWei,
-        uint256 _seasonEnd
+        uint256 _seasonEnd,
+        address _ramPriceOracle,
+        uint256 _ramCageMin,
+        uint256 _ramCageMax
     ) external initializer {
         __ReentrancyGuard_init();
         if (!(_taxToken != address(0))) revert ZeroAddress();
@@ -330,8 +333,14 @@ contract RamMiningVaultUpgradeable is
         priceDeviationBps = 500; // ±5% band vs referencePrice once armed (NVDA-appropriate default)
         windowStart = block.timestamp;
         // maxBnbOutPerFill, maxBnbOutPerWindow, referencePrice default to 0 (sells disabled / band off until armed).
-        // Phase-2: RAM sink pricing starts DISARMED (ramPriceOracle/ramPriceCageMin = 0 → rig #2+/repair/upgrade
-        // revert RamPricingNotArmed until the guardian wires the oracle + cage). Rig #1 in BNB always works.
+        // Phase-2: the LAUNCHER may arm the RAM sink pricing at creation via vaultData (the vault is then
+        // Phase-2-live from block one, no Guardian round-trip needed — consistent with the dev already choosing
+        // the reward token and feeds in vaultData). Zeros = DISARMED: rig #2+/repair/upgrade revert
+        // RamPricingNotArmed until armed. The Guardian keeps the setters either way. Rig #1 in BNB always works.
+        if (!(_ramCageMin <= _ramCageMax)) revert BadConfig();
+        ramPriceOracle = _ramPriceOracle;
+        ramPriceCageMin = _ramCageMin;
+        ramPriceCageMax = _ramCageMax;
         repairCostBps = 4000; // 40% of plan price per repair (guardian-tunable within [25%, 75%])
     }
 
@@ -1428,7 +1437,9 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
         beacon = address(new UpgradeableBeacon(address(impl)));
     }
 
-    /// @dev vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd).
+    /// @dev vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd,
+    ///      ramPriceOracle, ramCageMin, ramCageMax). The last three arm the Phase-2 RAM sink pricing at creation
+    ///      (zeros = disarmed; the Guardian can arm/adjust later).
     function newVault(address taxToken, address, address creator, bytes calldata vaultData)
         external
         override
@@ -1436,15 +1447,33 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     {
         if (!(msg.sender == _getVaultPortal())) revert OnlyVaultPortal();
         if (!(creator == DEV_ADDRESS)) revert NotAuthorized();
-        (address rewardToken, address rewardPriceFeed, address bnbPriceFeed, uint256 basePriceWei, uint256 seasonEnd) =
-            abi.decode(vaultData, (address, address, address, uint256, uint256));
+        (
+            address rewardToken,
+            address rewardPriceFeed,
+            address bnbPriceFeed,
+            uint256 basePriceWei,
+            uint256 seasonEnd,
+            address ramPriceOracle,
+            uint256 ramCageMin,
+            uint256 ramCageMax
+        ) = abi.decode(vaultData, (address, address, address, uint256, uint256, address, uint256, uint256));
 
         vault = address(
             new BeaconProxy(
                 beacon,
                 abi.encodeCall(
                     RamMiningVaultUpgradeable.initialize,
-                    (taxToken, rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd)
+                    (
+                        taxToken,
+                        rewardToken,
+                        rewardPriceFeed,
+                        bnbPriceFeed,
+                        basePriceWei,
+                        seasonEnd,
+                        ramPriceOracle,
+                        ramCageMin,
+                        ramCageMax
+                    )
                 )
             )
         );
@@ -1511,12 +1540,15 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
         schema.description =
             "Launch a RAM Mining Vault. Users buy BNB rig contracts to earn tokenized NVIDIA, acquired from keepers at the Chainlink oracle price plus a small clamped premium and funded by the RAM token's real trading fees, shared by mining power. Provide the reward token (NVDAB), the NVDA/USD and BNB/USD Chainlink feeds, the Micro rig base price, and the season end.";
-        schema.fields = new FieldDescriptor[](5);
+        schema.fields = new FieldDescriptor[](8);
         schema.fields[0] = FieldDescriptor("rewardToken", "address", "Tokenized NVIDIA reward token (NVDAB)", 0);
         schema.fields[1] = FieldDescriptor("rewardPriceFeed", "address", "Chainlink NVDA/USD price feed (8 dec)", 0);
         schema.fields[2] = FieldDescriptor("bnbPriceFeed", "address", "Chainlink BNB/USD price feed (8 dec)", 0);
         schema.fields[3] = FieldDescriptor("basePriceWei", "uint256", "Base price for Micro Rig in BNB", 18);
         schema.fields[4] = FieldDescriptor("seasonEnd", "time", "Mining season end timestamp", 0);
+        schema.fields[5] = FieldDescriptor("ramPriceOracle", "address", "RAM price oracle (0 = RAM sinks disarmed)", 0);
+        schema.fields[6] = FieldDescriptor("ramCageMin", "uint256", "RAM price cage floor, BNB wei per 1e18 RAM", 18);
+        schema.fields[7] = FieldDescriptor("ramCageMax", "uint256", "RAM price cage ceiling, BNB wei per 1e18 RAM", 18);
         schema.isArray = false;
     }
 }

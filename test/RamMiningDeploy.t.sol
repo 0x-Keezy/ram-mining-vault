@@ -47,12 +47,15 @@ contract RamMiningDeployTest is Test {
 
     function testFactoryReadback() public view {
         VaultDataSchema memory s = factory.vaultDataSchema();
-        assertEq(s.fields.length, 5);
+        assertEq(s.fields.length, 8);
         assertEq(s.fields[0].name, "rewardToken");
         assertEq(s.fields[1].name, "rewardPriceFeed");
         assertEq(s.fields[2].name, "bnbPriceFeed");
         assertEq(s.fields[3].name, "basePriceWei");
         assertEq(s.fields[4].name, "seasonEnd");
+        assertEq(s.fields[5].name, "ramPriceOracle");
+        assertEq(s.fields[6].name, "ramCageMin");
+        assertEq(s.fields[7].name, "ramCageMax");
 
         assertTrue(factory.beacon() != address(0));
         assertTrue(factory.beaconImplementation() != address(0));
@@ -65,7 +68,7 @@ contract RamMiningDeployTest is Test {
         uint256 basePrice = 0.001 ether;
         uint256 seasonEnd = block.timestamp + 60 days;
         bytes memory vaultData =
-            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
+            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0);
 
         // launch through the VaultPortal (as Flap would)
         vm.prank(BNB_TESTNET_VAULT_PORTAL);

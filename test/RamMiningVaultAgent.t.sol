@@ -88,7 +88,7 @@ contract RamMiningVaultAgentTest is Test {
 
         uint256 seasonEnd = block.timestamp + 60 days;
         bytes memory vaultData =
-            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
+            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
 

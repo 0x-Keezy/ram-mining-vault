@@ -104,15 +104,14 @@ contract RamMiningVaultPhase2Test is Test {
         factory = new RamMiningBeaconFactory();
 
         seasonEnd = block.timestamp + 90 days; // longer than RIG_LIFE so rigs get the full 60d
-        bytes memory vd = abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
+        // launcher-armed Phase-2: oracle + cage travel in vaultData (no Guardian round-trip needed)
+        oracle.set(RAM_BNB_PRICE, true);
+        bytes memory vd = abi.encode(
+            address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd,
+            address(oracle), CAGE_MIN, CAGE_MAX
+        );
         vm.prank(PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(address(ram), address(0), DEV, vd)));
-
-        oracle.set(RAM_BNB_PRICE, true);
-        vm.startPrank(GUARDIAN);
-        vault.setRamPriceOracle(address(oracle));
-        vault.setRamPriceCage(CAGE_MIN, CAGE_MAX);
-        vm.stopPrank();
 
         vm.deal(alice, 100 ether);
         vm.deal(bob, 100 ether);
