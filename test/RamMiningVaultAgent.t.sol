@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {RamMiningBeaconFactory, RamMiningVaultUpgradeable} from "../src/RamMiningVault.sol";
+import {InvalidLever, OnlyGuardian, OnlyTriggerService, StaleRequest} from "../src/RamMiningVault.sol";
 import {ITriggerReceiver} from "../src/flap/IFlapTriggerService.sol";
 
 contract AgentRewardToken is ERC20 {
@@ -111,7 +112,7 @@ contract RamMiningVaultAgentTest is Test {
     // ── config / access ────────────────────────────────────────────────
 
     function testConfigureAgentOnlyGuardian() public {
-        vm.expectRevert(bytes("Only Guardian"));
+        vm.expectRevert(OnlyGuardian.selector);
         vault.configureAgent(address(ai), address(triggerSvc), 1, 0, uint64(1 days));
     }
 
@@ -123,7 +124,7 @@ contract RamMiningVaultAgentTest is Test {
     function testInvalidLeverReverts() public {
         vm.prank(GUARDIAN);
         uint256 id = vault.requestReasoning();
-        vm.expectRevert(bytes("Invalid lever"));
+        vm.expectRevert(InvalidLever.selector);
         ai.fulfill(address(vault), id, 4); // LEVER_COUNT == 4 -> 4 (old PAUSE lever) is now out of range
     }
 
@@ -183,7 +184,7 @@ contract RamMiningVaultAgentTest is Test {
     // ── trigger / epoch loop ─────────────────────────────────────────────
 
     function testTriggerOnlyService() public {
-        vm.expectRevert(bytes("Only trigger service"));
+        vm.expectRevert(OnlyTriggerService.selector);
         vault.trigger(1);
     }
 
@@ -214,7 +215,7 @@ contract RamMiningVaultAgentTest is Test {
         assertEq(vault.lastReasoningRequestId(), 0);
 
         // replaying the SAME (already consumed) id must revert — a stale decision can't re-apply to fresh funds
-        vm.expectRevert(bytes("Stale/unknown reasoning"));
+        vm.expectRevert(StaleRequest.selector);
         ai.fulfill(address(vault), id, 1);
     }
 
@@ -222,7 +223,7 @@ contract RamMiningVaultAgentTest is Test {
         vm.prank(GUARDIAN);
         vault.requestReasoning(); // arms lastReasoningRequestId
         // a different id than the pending one must revert
-        vm.expectRevert(bytes("Stale/unknown reasoning"));
+        vm.expectRevert(StaleRequest.selector);
         ai.fulfill(address(vault), 999_999, 1);
     }
 
@@ -233,7 +234,7 @@ contract RamMiningVaultAgentTest is Test {
 
         triggerSvc.fire(address(vault), armedId); // consumes armedId, re-arms a fresh one
         // firing the old (consumed) trigger id again must revert
-        vm.expectRevert(bytes("Stale/unknown trigger"));
+        vm.expectRevert(StaleRequest.selector);
         triggerSvc.fire(address(vault), armedId);
     }
 

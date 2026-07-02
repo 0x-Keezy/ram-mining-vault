@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 import {RamMiningBeaconFactory, RamMiningVaultUpgradeable} from "../src/RamMiningVault.sol";
+import {BadFeedDecimals, BadFeedPrice, NoMiners, NotAuthorized, NothingToClaim, OnlyGuardian, OnlyVaultPortal, OverFillCap, OverWindowCap, PremiumOutOfRange, PriceOutOfBand, ReferenceNotArmed, RigEndsTooSoon, SeasonEnded, Slippage, StaleFeed, StaleRound, StalenessTooLoose, TimelockNotElapsed, TooManyRigs} from "../src/RamMiningVault.sol";
 import {VaultDataSchema, VaultUISchema} from "../src/flap/IVaultSchemasV1.sol";
 
 /// @dev Mintable ERC20 standing in for tokenized NVIDIA (NVDAB) in deterministic tests.
@@ -265,7 +266,7 @@ contract RamMiningVaultTest is Test {
     /// Rule 002 / reference test: newVault must revert for any caller other than the VaultPortal.
     function testFactoryRejectsNonVaultPortalCaller() public {
         bytes memory vd = abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
-        vm.expectRevert(bytes("Only VaultPortal"));
+        vm.expectRevert(OnlyVaultPortal.selector);
         factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd); // not pranked as the portal
     }
 
@@ -275,7 +276,7 @@ contract RamMiningVaultTest is Test {
         assertEq(factory.DEV_ADDRESS(), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1);
         bytes memory vd = abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
-        vm.expectRevert(bytes("Not authorized"));
+        vm.expectRevert(NotAuthorized.selector);
         factory.newVault(RAM_TOKEN, address(0), address(0xBAD), vd);
     }
 
@@ -431,7 +432,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("No miners"));
+        vm.expectRevert(NoMiners.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -446,7 +447,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Slippage"));
+        vm.expectRevert(Slippage.selector);
         vault.sellRWAToVault(1e18, quoted + 1); // demand more than the quote
         vm.stopPrank();
     }
@@ -463,7 +464,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Over per-fill cap"));
+        vm.expectRevert(OverFillCap.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -483,7 +484,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Over window cap"));
+        vm.expectRevert(OverWindowCap.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
 
@@ -543,7 +544,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Over per-fill cap"));
+        vm.expectRevert(OverFillCap.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -568,7 +569,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Price out of band"));
+        vm.expectRevert(PriceOutOfBand.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -617,7 +618,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Stale feed"));
+        vm.expectRevert(StaleFeed.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -633,7 +634,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Stale feed"));
+        vm.expectRevert(StaleFeed.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -648,7 +649,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Bad feed price"));
+        vm.expectRevert(BadFeedPrice.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -664,7 +665,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Stale round"));
+        vm.expectRevert(StaleRound.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -714,7 +715,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Over per-fill cap"));
+        vm.expectRevert(OverFillCap.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
     }
@@ -725,11 +726,11 @@ contract RamMiningVaultTest is Test {
         vault.setKeeperPremium(10100);
 
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes("Premium out of range"));
+        vm.expectRevert(PremiumOutOfRange.selector);
         vault.setKeeperPremium(9999); // below MIN
 
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes("Premium out of range"));
+        vm.expectRevert(PremiumOutOfRange.selector);
         vault.setKeeperPremium(10401); // above MAX (10400)
 
         vm.prank(GUARDIAN);
@@ -774,12 +775,12 @@ contract RamMiningVaultTest is Test {
     function testSetOracleGuardsCeilings() public {
         // reward-feed staleness above MAX_REWARD_FEED_STALE (30d) -> revert
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes("Reward staleness too loose"));
+        vm.expectRevert(StalenessTooLoose.selector);
         vault.setOracleGuards(200, 2 hours, 31 days);
 
         // BNB-feed staleness above MAX_BNB_FEED_STALE (1d) -> revert
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes("BNB staleness too loose"));
+        vm.expectRevert(StalenessTooLoose.selector);
         vault.setOracleGuards(200, 2 days, 7 days);
 
         // valid: NVDA 7d, BNB 6h
@@ -802,7 +803,7 @@ contract RamMiningVaultTest is Test {
         }
         (uint256 price,,,) = vault.getPlan(0);
         vm.prank(alice);
-        vm.expectRevert(bytes("Too many rigs"));
+        vm.expectRevert(TooManyRigs.selector);
         vault.buyMiningContract{value: price}(0);
     }
 
@@ -826,7 +827,7 @@ contract RamMiningVaultTest is Test {
         vm.warp(seasonEnd + 1);
         (uint256 price,,,) = vault.getPlan(0);
         vm.prank(alice);
-        vm.expectRevert(bytes("Mining season ended"));
+        vm.expectRevert(SeasonEnded.selector);
         vault.buyMiningContract{value: price}(0);
     }
 
@@ -852,7 +853,7 @@ contract RamMiningVaultTest is Test {
         // warp into the season-end bucket: a new rig's end caps to seasonEnd in the already-settled bucket -> reject
         vm.warp(block.timestamp + 25 hours);
         vm.prank(alice);
-        vm.expectRevert(bytes("Rig ends too soon"));
+        vm.expectRevert(RigEndsTooSoon.selector);
         v.buyMiningContract{value: price}(0);
     }
 
@@ -917,11 +918,11 @@ contract RamMiningVaultTest is Test {
     function testSetPriceFeedsRejectsNon8Decimals() public {
         MockPriceFeed bad = new MockPriceFeed(18, 100e8);
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes("Reward feed not 8dec"));
+        vm.expectRevert(BadFeedDecimals.selector);
         vault.setPriceFeeds(address(bad), address(bnbFeed));
 
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes("BNB feed not 8dec"));
+        vm.expectRevert(BadFeedDecimals.selector);
         vault.setPriceFeeds(address(nvdaFeed), address(bad));
     }
 
@@ -929,7 +930,7 @@ contract RamMiningVaultTest is Test {
         MockPriceFeed bad = new MockPriceFeed(6, 100e8);
         bytes memory vd = abi.encode(address(reward), address(bad), address(bnbFeed), basePrice, seasonEnd);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
-        vm.expectRevert(bytes("Reward feed not 8dec"));
+        vm.expectRevert(BadFeedDecimals.selector);
         factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vd);
     }
 
@@ -945,7 +946,7 @@ contract RamMiningVaultTest is Test {
     /// blocker #4b: enabling egress caps requires the deviation band to be armed first.
     function testSetKeeperLimitsRequiresReference() public {
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes("Arm reference price first"));
+        vm.expectRevert(ReferenceNotArmed.selector);
         vault.setKeeperLimits(1 ether, 1 ether);
 
         _armReference();
@@ -977,7 +978,7 @@ contract RamMiningVaultTest is Test {
         reward.mint(keeper, 1e18);
         vm.startPrank(keeper);
         reward.approve(address(vault), 1e18);
-        vm.expectRevert(bytes("Arm reference price first"));
+        vm.expectRevert(ReferenceNotArmed.selector);
         vault.sellRWAToVault(1e18, 0);
         vm.stopPrank();
 
@@ -995,7 +996,7 @@ contract RamMiningVaultTest is Test {
         factory.scheduleUpgrade(address(newImpl));
 
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes("Timelock not elapsed"));
+        vm.expectRevert(TimelockNotElapsed.selector);
         factory.executeUpgrade();
 
         vm.warp(block.timestamp + factory.UPGRADE_DELAY());
@@ -1006,7 +1007,7 @@ contract RamMiningVaultTest is Test {
 
     function testScheduleUpgradeOnlyGuardian() public {
         RamMiningVaultUpgradeable newImpl = new RamMiningVaultUpgradeable();
-        vm.expectRevert(bytes("Only Guardian"));
+        vm.expectRevert(OnlyGuardian.selector);
         factory.scheduleUpgrade(address(newImpl));
     }
 
@@ -1028,7 +1029,7 @@ contract RamMiningVaultTest is Test {
     }
 
     function testNonGuardianCannotLockVaultUpgrades() public {
-        vm.expectRevert(bytes("Only Guardian"));
+        vm.expectRevert(OnlyGuardian.selector);
         factory.lockVaultUpgrades();
         assertFalse(factory.isVaultUpgradesLocked());
     }
@@ -1041,7 +1042,7 @@ contract RamMiningVaultTest is Test {
         vm.prank(alice);
         vault.claimRewards();
         vm.prank(alice);
-        vm.expectRevert(bytes("Nothing to claim"));
+        vm.expectRevert(NothingToClaim.selector);
         vault.claimRewards();
     }
 
