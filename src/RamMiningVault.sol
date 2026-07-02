@@ -153,10 +153,11 @@ contract RamMiningVaultUpgradeable is
     uint256 public constant WEAR_EPOCH = 3 days; // one wear step every 3 days
     uint256 public constant WEAR_KEEP_BPS = 9500; // each step keeps 95% of the current level (d = 0.05)
     uint256 public constant WEAR_FLOOR_BPS = 4700; // effective power never decays below 47% of the plan power
-    uint256 public constant RIG_LIFE = 60 days; // hard rig lifetime (repairs/upgrades NEVER extend it)
+    // NOTE: a rig's lifetime is its AUDITED plan duration (1d/7d/30d/90d, season-capped) — unchanged from the
+    // contract Flap reviewed. The wear ladder runs WITHIN that lifetime; repairs/upgrades NEVER extend it.
     uint256 public constant RAM_BURN_BPS = 8500; // 85% of every RAM sink payment is burned…
     address public constant RAM_BURN_ADDR = 0x000000000000000000000000000000000000dEaD; // …to the dead address
-    uint256 public constant REPAIR_AGE_PENALTY_BPS = 3000; // repair restore-cap decays linearly to −30% over RIG_LIFE
+    uint256 public constant REPAIR_AGE_PENALTY_BPS = 3000; // repair restore-cap decays linearly to −30% over the rig's plan duration
     uint256 public constant MIN_REPAIR_COST_BPS = 2500; // guardian-tunable repair cost, hard-bounded [25%, 75%]
     uint256 public constant MAX_REPAIR_COST_BPS = 7500; //   of the rig's plan price
 
@@ -214,7 +215,7 @@ contract RamMiningVaultUpgradeable is
         uint256 id;
         uint256 planId;
         uint256 power; // start level of the CURRENT wear schedule (plan power at mint; restored level after repair)
-        uint256 startTime; // mint time — anchors RIG_LIFE (never moved by repair/upgrade)
+        uint256 startTime; // mint time — anchors the plan-duration lifetime (never moved by repair/upgrade)
         uint256 endTime;
         uint256 endBucket;
         uint256 rewardDebt; // accRewardPerPower checkpoint for this rig
@@ -355,7 +356,7 @@ contract RamMiningVaultUpgradeable is
     /// @notice Buy a mining rig. Phase-2 two-phase economy: the FIRST rig of a wallet is paid in native BNB
     ///         (the entry — also the honest per-wallet Sybil limiter); every later rig is paid in the RAM tax
     ///         token, converted from the plan's BNB price via the RAM price oracle (85% burned / 15% retained).
-    ///         All rigs live RIG_LIFE (60d, capped by season end) and wear down 5% every 3 days to a 47% floor.
+    ///         Rigs keep their AUDITED per-plan durations (season-capped) and wear 5% every 3 days to a 47% floor.
     function buyMiningContract(uint256 planId) external payable nonReentrant {
         if (!(planId < PLAN_COUNT)) revert InvalidPlan();
         if (!(block.timestamp < seasonEnd)) revert SeasonEnded();
@@ -364,10 +365,10 @@ contract RamMiningVaultUpgradeable is
         _compact(msg.sender);
         if (!(userRigs[msg.sender].length < MAX_CONTRACTS_PER_USER)) revert TooManyRigs();
 
-        (uint256 priceWei, uint256 power,,) = _plan(planId);
+        (uint256 priceWei, uint256 power, uint256 duration,) = _plan(planId);
 
         uint256 start = block.timestamp;
-        uint256 end = start + RIG_LIFE;
+        uint256 end = start + duration; // AUDITED per-plan duration (1d/7d/30d/90d), season-capped below
         if (end > seasonEnd) {
             end = seasonEnd;
         }
@@ -450,8 +451,8 @@ contract RamMiningVaultUpgradeable is
     // ──────────────────────────────────────────────────────────────────────────
 
     /// @notice Repair a live rig: pay RAM (85% burned) to reset its wear ladder NOW at a restored level. The
-    ///         restore cap decays linearly with the rig's AGE (100% → 70% of plan power over RIG_LIFE), so old
-    ///         rigs restore less — and the RIG_LIFE wall itself is NEVER extended. Claimable NVDA is untouched.
+    ///         restore cap decays linearly with the rig's AGE (100% → 70% of plan power over its plan duration),
+    ///         so old rigs restore less — and the lifetime wall itself is NEVER extended. Claimable NVDA is untouched.
     function repairRig(uint256 index) external nonReentrant {
         _settleExpiries();
         Rig[] storage rigs = userRigs[msg.sender];
@@ -459,8 +460,8 @@ contract RamMiningVaultUpgradeable is
         Rig storage r = rigs[index];
         if (!(block.timestamp < r.endTime && block.timestamp / BUCKET < r.endBucket)) revert RigExpired();
 
-        (uint256 planPrice, uint256 planPower,,) = _plan(r.planId);
-        uint256 capBps = BPS_DENOM - ((block.timestamp - r.startTime) * REPAIR_AGE_PENALTY_BPS) / RIG_LIFE;
+        (uint256 planPrice, uint256 planPower, uint256 planDuration,) = _plan(r.planId);
+        uint256 capBps = BPS_DENOM - ((block.timestamp - r.startTime) * REPAIR_AGE_PENALTY_BPS) / planDuration;
         uint256 restored = (planPower * capBps) / BPS_DENOM;
         uint256 floorLvl = _floorLevel(r.planId);
         if (restored < floorLvl) restored = floorLvl;
@@ -472,8 +473,8 @@ contract RamMiningVaultUpgradeable is
     }
 
     /// @notice Upgrade a live rig to a higher tier: pay the plan-price DIFFERENCE in RAM (85% burned). The rig
-    ///         becomes the new tier at full power with a FRESH wear ladder (new hardware), but its RIG_LIFE wall
-    ///         stays anchored to the ORIGINAL mint — upgrades never extend a rig's life.
+    ///         becomes the new tier at full power with a FRESH wear ladder (new hardware), but its lifetime
+    ///         (ORIGINAL plan duration from mint) is NEVER extended — no buying a 1d Micro to smuggle a 90d Hyper.
     function upgradeRig(uint256 index, uint256 newPlanId) external nonReentrant {
         if (!(newPlanId < PLAN_COUNT)) revert InvalidPlan();
         _settleExpiries();
@@ -1389,13 +1390,12 @@ contract RamMiningVaultUpgradeable is
     //  Plans
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// @dev v3 tier table. All tiers live RIG_LIFE (60d, season-capped) — the wear ladder, not the duration, is
-    ///      what differentiates lived value. Powers follow the approved α=0.95 concave curve applied per plan
-    ///      (power ∝ spend^0.95 at spend multiples 1/3/8/20 → 10/28/72/172): power-per-BNB DECREASES with tier
-    ///      (1.00 → 0.93 → 0.90 → 0.86 ×base), the anti-BigCoin invariant. (Per-WALLET cumulative concavity is
-    ///      v3-complete scope, via beacon upgrade.) This supersedes the audited v2 table (10/40/130/420 with
-    ///      1d/7d/30d/90d durations), whose integrated whale-skew was the disclosed F2 finding — the v3 table
-    ///      flattens that skew from ~189× to ~0.86× (mildly anti-whale).
+    /// @dev AUDITED tier table — UNCHANGED from the v2 contract Flap reviewed. Per our F2 "By Design"
+    ///      response to the Flap Risk Report, the four Genesis tiers (powers, prices AND durations) are
+    ///      deliberately NOT rebalanced: the yield-per-BNB spread is publicly disclosed via getPlan, bounded
+    ///      by the seasonEnd cap (end = min(start + duration, seasonEnd)), and Phase 2 rebalances scaling
+    ///      incentives ECONOMICALLY (subsequent rigs/upgrades/repairs are paid in RAM) — not by re-numbering
+    ///      the audited table. The v3 wear ladder operates WITHIN each rig's own audited duration.
     function _plan(uint256 planId)
         internal
         view
@@ -1403,13 +1403,13 @@ contract RamMiningVaultUpgradeable is
     {
         if (!(planId < PLAN_COUNT)) revert InvalidPlan();
         if (planId == 0) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei, 10, RIG_LIFE, "Micro Rig");
+            (priceWei, power, durationSeconds, name) = (basePriceWei, 10, 1 days, "Micro Rig");
         } else if (planId == 1) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 3, 28, RIG_LIFE, "Core Rig");
+            (priceWei, power, durationSeconds, name) = (basePriceWei * 3, 40, 7 days, "Core Rig");
         } else if (planId == 2) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 8, 72, RIG_LIFE, "Mega Rig");
+            (priceWei, power, durationSeconds, name) = (basePriceWei * 8, 130, 30 days, "Mega Rig");
         } else {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 20, 172, RIG_LIFE, "Hyper Rig");
+            (priceWei, power, durationSeconds, name) = (basePriceWei * 20, 420, 90 days, "Hyper Rig");
         }
         if (!(priceWei > 0 && power > 0 && durationSeconds > 0)) revert BadPlanParams();
     }

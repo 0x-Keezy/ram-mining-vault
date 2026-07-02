@@ -103,7 +103,7 @@ contract RamMiningVaultPhase2Test is Test {
         bnbFeed = new P2MockFeed(600e8);
         factory = new RamMiningBeaconFactory();
 
-        seasonEnd = block.timestamp + 90 days; // longer than RIG_LIFE so rigs get the full 60d
+        seasonEnd = block.timestamp + 90 days; // long enough for every plan to get its full audited duration
         // launcher-armed Phase-2: oracle + cage travel in vaultData (no Guardian round-trip needed)
         oracle.set(RAM_BNB_PRICE, true);
         bytes memory vd = abi.encode(
@@ -197,59 +197,59 @@ contract RamMiningVaultPhase2Test is Test {
         // TIMESTAMP as constant within a call and propagates `block.timestamp` to its use sites — even through
         // a local variable — so any warp target derived from block.timestamp after a prior warp is wrong
         // (cheatcode-only artifact; in production the timestamp IS constant within a tx).
-        _buyBnb(alice, 3); // Hyper: 172 power, bought at t = 100 days
+        _buyBnb(alice, 3); // Hyper: 420 power (AUDITED table), 90d, bought at t = 100 days
         (, uint256 p0,,) = vault.getPlan(3);
-        assertEq(p0, 172);
+        assertEq(p0, 420);
         (, uint256 cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 172);
+        assertEq(cur, 420);
 
-        vm.warp(103 days); // 1 step: 172×0.95 = 163.4 → 163
+        vm.warp(103 days); // 1 step: 420×0.95 = 399
         (, cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 163);
+        assertEq(cur, 399);
 
-        vm.warp(106 days); // 2 steps: 163×0.95 = 154.85 → 154
+        vm.warp(106 days); // 2 steps: 399×0.95 = 379.05 → 379
         (, cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 154);
+        assertEq(cur, 379);
 
-        vm.warp(159 days); // deep into life (still alive): floor = 172×0.47 = 80.84 → 80
+        vm.warp(159 days); // deep into the 90d life (still alive): floor = 420×0.47 = 197.4 → 197
         (uint256 lvl, uint256 cur2, uint256 floorP,,,) = _wear(alice, 0);
-        assertEq(lvl, 172); // schedule start level unchanged (no repair)
-        assertEq(floorP, 80);
-        assertEq(cur2, 80); // decayed to the floor, NEVER zero while alive
+        assertEq(lvl, 420); // schedule start level unchanged (no repair)
+        assertEq(floorP, 197);
+        assertEq(cur2, 197); // decayed to the floor, NEVER zero while alive
     }
 
     /// @dev Aggregate machinery consistency: after settle, global active power equals the rig's live level.
     function testWearAggregateMatchesPerRig() public {
-        _buyBnb(alice, 3); // 172
-        vm.warp(block.timestamp + 7 days); // two steps settled (163 → 154)
+        _buyBnb(alice, 3); // Hyper 420
+        vm.warp(block.timestamp + 7 days); // two steps settled (399 → 379)
         vault.donateReward(1); // forces _settleExpiries
         (, uint256 cur,,,,) = _wear(alice, 0);
         (,, uint256 globalPower,,,,) = vault.getVaultMiningStats();
         assertEq(globalPower, cur);
-        assertEq(cur, 154);
+        assertEq(cur, 379);
     }
 
     function testWearAdjustsRewardSplit() public {
-        _buyBnb(alice, 0); // Micro 10
-        vm.warp(block.timestamp + 3 days + 1 hours); // alice stepped to 9
-        _buyBnb(bob, 1); // Core 28, fresh
-        vault.donateReward(37 ether); // settles: total power = 9 + 28 = 37
-        assertApproxEqAbs(vault.pendingRewards(alice), 9 ether, 1e6);
-        assertApproxEqAbs(vault.pendingRewards(bob), 28 ether, 1e6);
+        _buyBnb(alice, 2); // Mega 130, 30d
+        vm.warp(block.timestamp + 3 days + 1 hours); // alice stepped: 130×0.95 = 123.5 → 123
+        _buyBnb(bob, 1); // Core 40, fresh (its first step is 3d away)
+        vault.donateReward(163 ether); // settles: total power = 123 + 40 = 163
+        assertApproxEqAbs(vault.pendingRewards(alice), 123 ether, 1e6);
+        assertApproxEqAbs(vault.pendingRewards(bob), 40 ether, 1e6);
     }
 
     // ── repair ──────────────────────────────────────────────────────────
 
     function testRepairRestoresPowerRespectsAgeCapAndLife() public {
-        _buyBnb(alice, 3); // Hyper 172
+        _buyBnb(alice, 3); // Hyper 420, 90d
         (,,,, uint256 lifeEnds0,) = _wear(alice, 0);
 
-        vm.warp(block.timestamp + 12 days); // 4 steps: 172→163→154→146→138
+        vm.warp(block.timestamp + 12 days); // 4 steps: 420→399→379→360→342
         (, uint256 cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 138);
-        vault.donateReward(138 ether); // some pending at the worn level
+        assertEq(cur, 342);
+        vault.donateReward(342 ether); // some pending at the worn level
         uint256 pendingBefore = vault.pendingRewards(alice);
-        assertApproxEqAbs(pendingBefore, 138 ether, 1e6);
+        assertApproxEqAbs(pendingBefore, 342 ether, 1e6);
 
         // repair cost: planPrice × 40% → RAM units
         (uint256 planPrice,,,) = vault.getPlan(3);
@@ -263,16 +263,16 @@ contract RamMiningVaultPhase2Test is Test {
         vault.repairRig(0);
         assertEq(ram.balanceOf(alice), ramBefore - expectedUnits);
 
-        // age 12d of 60d → penalty 3000×12/60 = 600 bps → cap 94% → restored = 172×0.94 = 161.68 → 161
+        // age 12d of the Hyper's 90d → penalty 3000×12/90 = 400 bps → cap 96% → restored = 420×0.96 = 403.2 → 403
         (uint256 lvl, uint256 cur2,,, uint256 lifeEnds1, uint256 accrued) = _wear(alice, 0);
-        assertEq(lvl, 161);
-        assertEq(cur2, 161);
+        assertEq(lvl, 403);
+        assertEq(cur2, 403);
         assertEq(lifeEnds1, lifeEnds0); // RIG_LIFE wall NEVER extended
         assertApproxEqAbs(accrued, pendingBefore, 1e6); // pending checkpointed, not lost
 
         // aggregate consistent after reschedule
         (,, uint256 globalPower,,,,) = vault.getVaultMiningStats();
-        assertEq(globalPower, 161);
+        assertEq(globalPower, 403);
 
         // the checkpointed pending is claimable
         vm.prank(alice);
@@ -298,27 +298,27 @@ contract RamMiningVaultPhase2Test is Test {
     // ── upgrade ─────────────────────────────────────────────────────────
 
     function testUpgradeTierPaysDifferenceAndRestartsWear() public {
-        _buyBnb(alice, 0); // Micro 10
-        vm.warp(block.timestamp + 6 days); // 2 steps: 10→9→8
+        _buyBnb(alice, 1); // Core 40, 7d
+        vm.warp(block.timestamp + 6 days); // 2 steps: 40→38→36 (still alive: dies at 7d)
         (, uint256 cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 8);
+        assertEq(cur, 36);
         (,,,, uint256 lifeEnds0,) = _wear(alice, 0);
 
-        (uint256 oldPrice,,,) = vault.getPlan(0);
-        (uint256 newPrice, uint256 newPower,,) = vault.getPlan(1); // Core 28
+        (uint256 oldPrice,,,) = vault.getPlan(1);
+        (uint256 newPrice, uint256 newPower,,) = vault.getPlan(2); // Mega 130
         uint256 expectedUnits = _ramUnitsFor(newPrice - oldPrice);
-        (uint256 quoted, bool trusted) = vault.quoteUpgradeInRam(alice, 0, 1);
+        (uint256 quoted, bool trusted) = vault.quoteUpgradeInRam(alice, 0, 2);
         assertTrue(trusted);
         assertEq(quoted, expectedUnits);
 
         uint256 ramBefore = ram.balanceOf(alice);
         vm.prank(alice);
-        vault.upgradeRig(0, 1);
+        vault.upgradeRig(0, 2);
         assertEq(ram.balanceOf(alice), ramBefore - expectedUnits);
 
         (uint256 id, uint256 planId, uint256 power,,,,, bool active) = vault.getMiningContract(alice, 0);
         assertEq(id, 1);
-        assertEq(planId, 1);
+        assertEq(planId, 2);
         assertEq(power, newPower); // fresh hardware at full new-tier power
         assertTrue(active);
         (,,,, uint256 lifeEnds1,) = _wear(alice, 0);
@@ -329,7 +329,7 @@ contract RamMiningVaultPhase2Test is Test {
     }
 
     function testUpgradeRejectsDowngradeAndSamePlan() public {
-        _buyBnb(alice, 1); // Core
+        _buyBnb(alice, 1); // Core (7d)
         vm.startPrank(alice);
         vm.expectRevert(InvalidUpgrade.selector);
         vault.upgradeRig(0, 1); // same plan
@@ -403,12 +403,13 @@ contract RamMiningVaultPhase2Test is Test {
         _buyRam(alice, 1);
         vault.donateReward(80 ether);
 
-        vm.warp(127 days);
+        vm.warp(118 days); // alice's RAM Core (bought at 115d, 7d life) is still alive
+        // NOTE: index 0 — the dead, fully-claimed Micro was compacted away by the RAM buy at 115d
         vm.prank(alice);
-        vault.upgradeRig(1, 2);
+        vault.upgradeRig(0, 2);
         vault.donateReward(70 ether);
 
-        vm.warp(167 days); // everything expires (past 60d rig life for early rigs)
+        vm.warp(167 days); // early rigs expired (Micro 1d, Cores 7d, Mega-upgraded 122d); Hyper still alive
         vm.prank(alice);
         vault.claimRewards();
         vm.prank(bob);

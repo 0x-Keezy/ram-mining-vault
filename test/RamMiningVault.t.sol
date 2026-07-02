@@ -390,10 +390,10 @@ contract RamMiningVaultTest is Test {
 
     function testProportionalSplit() public {
         _buy(alice, 0); // 10 power
-        _buy(bob, 1); // Core: 28 power (v3 concave table) -> total 38
-        _inject(38 ether);
+        _buy(bob, 1); // 40 power -> total 50
+        _inject(50 ether);
         assertApproxEqAbs(vault.pendingRewards(alice), 10 ether, 1e6);
-        assertApproxEqAbs(vault.pendingRewards(bob), 28 ether, 1e6);
+        assertApproxEqAbs(vault.pendingRewards(bob), 40 ether, 1e6);
     }
 
     function testRewardWhileNoPowerGoesToFirstMiner() public {
@@ -419,19 +419,18 @@ contract RamMiningVaultTest is Test {
     // ── per-rig expiry (lazy buckets) ──────────────────────────────────
 
     function testExpiryFreezesRigButActiveKeepsEarning() public {
-        // v3: all rigs live RIG_LIFE (60d) capped by the season, so per-plan early expiry is gone. The freeze
-        // property still holds at season end: pending is frozen at the expiry snapshot and never grows after.
-        _buy(alice, 0); // Micro 10 power, expires with the season (60d)
-        _inject(50 ether); // alice is the only miner -> all 50
-        assertApproxEqAbs(vault.pendingRewards(alice), 50 ether, 1e6);
+        _buy(alice, 0); // Micro 10 power, 1 day (AUDITED per-plan duration)
+        _buy(bob, 1); // Core 40 power, 7 days -> total 50
+        _inject(50 ether);
 
-        vm.warp(seasonEnd + 1); // rig expired with the season
-        _inject(40 ether); // no active power -> buffered as rewardUndistributed, nothing accrues to alice
-        assertApproxEqAbs(vault.pendingRewards(alice), 50 ether, 1e6); // frozen at expiry
+        vm.warp(block.timestamp + 2 days); // alice expired (1d); bob active, no wear step yet (first at 3d)
+        _inject(40 ether);
+
+        assertApproxEqAbs(vault.pendingRewards(alice), 10 ether, 1e6);
+        assertApproxEqAbs(vault.pendingRewards(bob), 80 ether, 1e6);
 
         (,, uint256 power,,,,) = vault.getVaultMiningStats();
-        assertEq(power, 0);
-        assertEq(vault.rewardUndistributed(), 40 ether);
+        assertEq(power, 40);
     }
 
     // ── keeper / RFQ acquisition ───────────────────────────────────────
@@ -1141,12 +1140,12 @@ contract RamMiningVaultTest is Test {
     }
 
     function testGetMiningContractView() public {
-        _buy(alice, 2); // Mega: 72 power (v3 concave table), RIG_LIFE
+        _buy(alice, 2); // Mega: 130 power, 30 days (AUDITED table)
         (uint256 id, uint256 planId, uint256 power,,,, uint256 pending, bool active) =
             vault.getMiningContract(alice, 0);
         assertEq(id, 1);
         assertEq(planId, 2);
-        assertEq(power, 72);
+        assertEq(power, 130);
         assertEq(pending, 0);
         assertTrue(active);
     }

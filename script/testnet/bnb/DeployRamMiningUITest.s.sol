@@ -63,9 +63,9 @@ contract DeployRamMiningUITest is Script {
         //    then UPGRADE rig #1 Micro → Core (price difference in RAM, fresh wear ladder).
         tnvda.mint(DEPLOYER, 50_000e18);
         tnvda.approve(address(vault), type(uint256).max);
-        vault.buyMiningContract{value: basePriceWei}(0); // rig #1: Micro (BNB entry), power 10
-        vault.buyMiningContract(2); // rig #2: Mega in RAM, power 72
-        vault.upgradeRig(0, 1); // rig #1 → Core in RAM, power 28 (fresh ladder, life unchanged)
+        vault.buyMiningContract{value: basePriceWei * 3}(1); // rig #1: Core (BNB entry), power 40, 7d
+        vault.buyMiningContract(3); // rig #2: Hyper in RAM, power 420, 90d (85% of the RAM burned)
+        vault.upgradeRig(0, 2); // rig #1 Core → Mega in RAM, power 130 fresh (lifetime unchanged)
 
         // 4) SEED rewards: donate — distributes pro-rata to the active (wear-decaying) power
         vault.donateReward(400e18);
