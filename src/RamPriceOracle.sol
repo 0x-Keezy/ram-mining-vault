@@ -279,6 +279,14 @@ contract RamPriceOracle {
 
         if (block.number == _lastRecordBlock) return; // per-block dedupe
 
+        // Liquidity floor at RECORD time too (not only at read): a 1-block flash-donation that inflates reserves
+        // must not be able to write a manipulated interval into the ring. A thin pool simply records no
+        // observation until real depth returns (adversarial review fix #3, anti-TOCTOU).
+        (uint112 rr0, uint112 rr1,, bool okRR) = _reserves(pair);
+        if (!okRR) return;
+        uint256 wbnbRecRes = ramIsToken0 ? uint256(rr1) : uint256(rr0);
+        if (wbnbRecRes < minReservesWbnb) return;
+
         (uint256 cumNow, bool okCum) = _currentCumulative(pair, ramIsToken0);
         if (!okCum) return;
         cumNow &= MASK224;
@@ -404,13 +412,20 @@ contract RamPriceOracle {
         return (p * 1e18) / Q112;
     }
 
-    /// @dev Clamp a raw interval price to ±maxTruncBps of the previous truncated price (the truncated-oracle cap).
+    /// @dev ASYMMETRIC truncated-oracle cap: an interval price may RISE at most `maxTruncBps` above the previous
+    ///      truncated price, but may FALL freely. Rationale (adversarial review, blocker): a symmetric clamp lets
+    ///      the truncated price (and thus TWAP5, the "current" leg of min()) lag HIGH for several intervals after a
+    ///      manipulated spike is released — defeating the min() anti-inflation bias and yielding trusted=true at an
+    ///      inflated price (the one INACCEPTABLE case). Letting the price fall freely makes TWAP5 track the real
+    ///      price down the instant the attacker releases, so min() collapses to the real price. A downward
+    ///      manipulation now passes through as a LOW price → the vault OVER-charges RAM → the safe direction, which
+    ///      is exactly the design's "always fail toward over-charging" invariant. The upside cap still throttles a
+    ///      sustained pump (a >maxTruncBps rise per interval is capped every interval), so a real attacker must hold
+    ///      the pool high across the whole TWAP window — the expensive, arbitraged, normal-TWAP threat model.
     function _clamp(uint256 p, uint256 pt) private view returns (uint256) {
-        uint256 lo = (pt * (BPS - maxTruncBps)) / BPS;
         uint256 hi = (pt * (BPS + maxTruncBps)) / BPS;
-        if (p < lo) return lo;
         if (p > hi) return hi;
-        return p;
+        return p; // no lower clamp — prices fall freely (safe direction: low price ⇒ over-charge)
     }
 
     // ─────────────────────────────────────────────────────────────────────────

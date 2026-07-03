@@ -278,14 +278,17 @@ contract RamPriceOracleTest is Test {
         assertGe(pr, P, "still moved up a touch");
     }
 
-    /// A -1000x one-interval crash: TWAP5 hits the -50% truncation floor and min() picks it -> exactly ~0.5P.
+    /// A -1000x one-interval crash: with ASYMMETRIC truncation the price falls FREELY (no -50% floor), so TWAP5
+    /// tracks the crash all the way down and min() picks it. A low price is the SAFE direction (the vault
+    /// over-charges RAM). This is the intended behaviour after the adversarial-review fix — a downward move is
+    /// never clamped, only upward moves are throttled.
     function testTruncationCrashAndMinPicksTwap5() public {
         _deployGraduated();
         _buildMaturePool(P, 7);
         _step(300, P / 1000); // crash
         (uint256 pr, bool tr) = oracle.getPrice(RAM);
         assertTrue(tr);
-        _assertApprox(pr, P / 2, 300, "crash floored at -50% via TWAP5 min"); // 3% tol
+        assertLe(pr, P / 2, "crash falls freely (asymmetric trunc): price well below 0.5P, the safe direction");
     }
 
     function testLiquidityFloorUntrusted() public {
