@@ -11,7 +11,8 @@ import {
     UnexpectedValue,
     NothingToRepair,
     TooManyRigs,
-    EntryRigMustBeMicro
+    EntryRigMustBeMicro,
+    InsufficientPayment
 } from "../src/RamMiningVault.sol";
 
 contract P2MockToken is ERC20 {
@@ -214,6 +215,15 @@ contract RamMiningVaultPhase2Test is Test {
         (uint256 count,,,,) = vault.getUserMinerStats(alice);
         assertEq(count, 0);
         assertEq(vault.totalNativePaid(), 0);
+    }
+
+    function testEntryUnderpayReverts() public {
+        // judge MENOR-1: the entry payment check itself had no direct test (pre-existing gap, now that the
+        // entry path changed it gets one)
+        (uint256 price,,,) = vault.getPlan(0);
+        vm.prank(alice);
+        vm.expectRevert(InsufficientPayment.selector);
+        vault.buyMiningContract{value: price - 1}(0);
     }
 
     function testEntryGateOverpayingDoesNotBypass() public {
