@@ -35,6 +35,8 @@ forge build
 
 `foundry.toml` pins everything relevant: `solc 0.8.26`, `evm_version = "cancun"`, `via_ir = true`, `optimizer_runs = 1`, `bytecode_hash = "none"`. These are **deployability requirements** (EIP-170/EIP-3860), not optimization choices — see §4 of our re-review letter (the audited v2 at 99999 runs compiled to 40,004 B runtime, undeployable).
 
+**Dependencies (not bundled in the source-only ZIP — per your request to keep it small):** OpenZeppelin `openzeppelin-contracts` **v4.9.6** + `openzeppelin-contracts-upgradeable` **v4.9.6**, and `forge-std`. Restore with `forge install OpenZeppelin/openzeppelin-contracts@v4.9.6 OpenZeppelin/openzeppelin-contracts-upgradeable@v4.9.6 foundry-rs/forge-std` (or use the full public repo, which vendors them). Remappings are in `remappings.txt`. `src/flap/*` is Flap's own V2 framework, unmodified.
+
 Size gate (run it — it is the pre-broadcast gate we use):
 
 ```
