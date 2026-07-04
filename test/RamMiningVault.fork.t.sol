@@ -3,7 +3,32 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
+import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {RamMiningBeaconFactory, RamMiningVaultUpgradeable, AggregatorV3Interface} from "../src/RamMiningVault.sol";
+
+/// @dev Mintable RAM tax-token stand-in deployed INTO the fork (the real RAM token doesn't exist pre-launch).
+///      Needed since the v3 entry gate: a fresh wallet may only buy the Micro with BNB, so the long-lived
+///      Hyper this test requires must be bought through the (armed) RAM path — the legal post-gate flow.
+contract ForkRamToken is ERC20 {
+    constructor() ERC20("Fork RAM", "fRAM") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+/// @dev Fixed-price RAM oracle for the fork vault (same shape as the unit suites' mock).
+contract ForkRamOracle {
+    uint256 internal constant PRICE = 2e12; // 1 RAM = 0.000002 BNB
+
+    function pokeAndGetPrice(address) external pure returns (uint256, bool) {
+        return (PRICE, true);
+    }
+
+    function getPrice(address) external pure returns (uint256, bool) {
+        return (PRICE, true);
+    }
+}
 
 /// @title RAM mainnet-fork test against the REAL tokenized-NVIDIA token (NVDAB) on BNB mainnet — KEEPER model.
 /// @notice The honest way to test the v2 keeper/RFQ acquisition + distribution against a real regulated asset and
@@ -43,22 +68,29 @@ contract RamMiningVaultForkTest is Test {
         return vm.envOr("REWARD_STALE", uint256(7 days));
     }
 
+    ForkRamToken internal forkRam;
+
     /// @dev Deploy + set realistic oracle guards. Split out to keep the test function's stack shallow.
+    ///      v3 entry gate: the RAM sink pricing is ARMED at creation (mock RAM token + fixed-price oracle
+    ///      deployed into the fork) so the test can hold the long-lived Hyper through the LEGAL flow
+    ///      (Micro entry in BNB + Hyper growth in RAM). Keeper/claim paths never touch the RAM oracle.
     function _deployForkVault(address nvda) internal returns (RamMiningVaultUpgradeable vault) {
         RamMiningBeaconFactory factory = new RamMiningBeaconFactory();
+        forkRam = new ForkRamToken();
+        ForkRamOracle ramOracle = new ForkRamOracle();
         bytes memory vaultData = abi.encode(
             nvda,
             vm.envOr("NVDA_USD_FEED", NVDA_USD),
             vm.envOr("BNB_USD_FEED", BNB_USD),
             uint256(0.001 ether),
             block.timestamp + 120 days,
-            address(0),
-            uint256(0),
-            uint256(0),
+            address(ramOracle),
+            uint256(1e12),
+            uint256(4e12),
             address(0x7E57)
         );
         vm.prank(BNB_MAINNET_VAULT_PORTAL);
-        vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
+        vault = RamMiningVaultUpgradeable(payable(factory.newVault(address(forkRam), address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
         // BNB/USD tight (24/7), NVDA/USD generous (weekend continuous operation per Flap #8).
         vm.prank(GUARDIAN_MAINNET);
         vault.setOracleGuards(500, 2 hours, _rewardStale());
@@ -93,12 +125,18 @@ contract RamMiningVaultForkTest is Test {
 
         RamMiningVaultUpgradeable vault = _deployForkVault(nvda);
 
-        // a miner buys a long-lived (Hyper) rig. Read basePriceWei() BEFORE the prank — an external call inside
-        // {value:...} would otherwise consume vm.prank (Foundry gotcha) and the rig would go to the test contract.
+        // a miner acquires a long-lived (Hyper) rig through the LEGAL v3 flow — entry gate: the first rig
+        // must be the Micro in BNB; the Hyper is then bought through the armed RAM path. Read prices BEFORE
+        // the prank — an external call inside {value:...} would otherwise consume vm.prank (Foundry gotcha).
         vm.deal(MINER, 1 ether);
-        (uint256 hyperPrice,,,) = vault.getPlan(3);
+        (uint256 microPrice,,,) = vault.getPlan(0);
         vm.prank(MINER);
-        vault.buyMiningContract{value: hyperPrice}(3);
+        vault.buyMiningContract{value: microPrice}(0); // entry rig (Micro, 1d — expires before the stale warp)
+        forkRam.mint(MINER, 1e24);
+        vm.prank(MINER);
+        forkRam.approve(address(vault), type(uint256).max);
+        vm.prank(MINER);
+        vault.buyMiningContract(3); // growth rig: Hyper (90d) paid in RAM — keeps the miner alive at the wall
         // simulate BNB fees arriving in the vault treasury
         vm.deal(address(vault), 5 ether);
 

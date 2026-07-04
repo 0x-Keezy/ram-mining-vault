@@ -94,6 +94,7 @@ error InvalidUpgrade();
 error UnexpectedValue();
 error NothingToRepair();
 error NoRamReceived();
+error EntryRigMustBeMicro();
 
 /// @title RamMiningVaultUpgradeable
 /// @notice Flap V2 real-yield mining vault for the RAM project — KEEPER/RFQ model (v2).
@@ -157,6 +158,11 @@ contract RamMiningVaultUpgradeable is
     // contract Flap reviewed. The wear ladder runs WITHIN that lifetime; repairs/upgrades NEVER extend it.
     uint256 public constant RAM_BURN_BPS = 8500; // 85% of every RAM sink payment is burned…
     address public constant RAM_BURN_ADDR = 0x000000000000000000000000000000000000dEaD; // …to the dead address
+    /// @dev The ONLY plan a fresh wallet may buy with BNB (the entry). Higher tiers are reached exclusively
+    ///      through the RAM sinks (growth rigs / upgrades), so no wallet can hold sustained high power without
+    ///      flowing through the 85% burn / 15% treasury loop. Without this gate a whale could enter straight
+    ///      at the top tier in BNB and never touch RAM (found in live testnet QA, 2026-07-03).
+    uint256 public constant ENTRY_PLAN_ID = 0; // Micro — the AUDITED tier table itself is untouched
     uint256 public constant REPAIR_AGE_PENALTY_BPS = 3000; // repair restore-cap decays linearly to −30% over the rig's plan duration
     uint256 public constant MIN_REPAIR_COST_BPS = 2500; // guardian-tunable repair cost, hard-bounded [25%, 75%]
     uint256 public constant MAX_REPAIR_COST_BPS = 7500; //   of the rig's plan price
@@ -362,8 +368,9 @@ contract RamMiningVaultUpgradeable is
     // ──────────────────────────────────────────────────────────────────────────
 
     /// @notice Buy a mining rig. Phase-2 two-phase economy: the FIRST rig of a wallet is paid in native BNB
-    ///         (the entry — also the honest per-wallet Sybil limiter); every later rig is paid in the RAM tax
-    ///         token, converted from the plan's BNB price via the RAM price oracle (85% burned / 15% treasury).
+    ///         and MUST be the entry plan (Micro, `ENTRY_PLAN_ID`) — the honest per-wallet Sybil limiter, not a
+    ///         bypass of the RAM economy; every later rig (any tier) is paid in the RAM tax token, converted
+    ///         from the plan's BNB price via the RAM price oracle (85% burned / 15% treasury).
     ///         Rigs keep their AUDITED per-plan durations (season-capped) and wear 5% every 3 days to a 47% floor.
     function buyMiningContract(uint256 planId) external payable nonReentrant {
         if (!(planId < PLAN_COUNT)) revert InvalidPlan();
@@ -391,7 +398,10 @@ contract RamMiningVaultUpgradeable is
 
         uint256 ramPaid;
         if (!hasEnteredBefore[msg.sender]) {
-            // ── entry rig: BNB path (the audited v2 path, unchanged) ──
+            // ── entry rig: BNB path, ENTRY TIER ONLY (v3 entry gate) ──
+            // A fresh wallet may only buy the Micro with BNB; sustained/high power must flow through the
+            // RAM sinks. Charging logic below is the audited v2 path, unchanged.
+            if (!(planId == ENTRY_PLAN_ID)) revert EntryRigMustBeMicro();
             hasEnteredBefore[msg.sender] = true;
             if (!(msg.value >= priceWei)) revert InsufficientPayment();
             // Refund excess BNB before recording state (safe-order; full revert on failure).

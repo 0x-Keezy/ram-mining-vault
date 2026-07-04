@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, StdStorage, stdStorage} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 import {RamMiningBeaconFactory, RamMiningVaultUpgradeable} from "../src/RamMiningVault.sol";
@@ -180,6 +180,8 @@ contract ReentrantKeeper {
 }
 
 contract RamMiningVaultTest is Test {
+    using stdStorage for StdStorage;
+
     address constant BNB_TESTNET_VAULT_PORTAL = 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f;
     address constant GUARDIAN = 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950;
     address constant RAM_TOKEN = address(0x4A11); // taxToken placeholder (not held by vault)
@@ -285,10 +287,25 @@ contract RamMiningVaultTest is Test {
         vault.donateReward(amount);
     }
 
+    /// @dev v3 entry-gate: a fresh wallet may only buy plan 0 (Micro) with BNB. For any higher tier this
+    ///      helper performs the LEGAL post-gate flow — mark the wallet as already-entered (stdstore) and buy
+    ///      through the RAM path — so every scenario keeps the exact same rig (power/duration/id), the same
+    ///      clock and the same math, with no extra entry rig. RAM pricing is armed in setUp; keeper tests
+    ///      fund the vault's BNB explicitly with vm.deal, so no scenario relies on entry BNB for funding.
     function _buy(address who, uint256 plan) internal {
+        if (plan != 0) {
+            _enter(who);
+            _buyRam(who, plan);
+            return;
+        }
         (uint256 price,,,) = vault.getPlan(plan);
         vm.prank(who);
         vault.buyMiningContract{value: price}(plan);
+    }
+
+    /// @dev Mark `who` as already-entered (the post-gate precondition), without minting an entry rig.
+    function _enter(address who) internal {
+        stdstore.target(address(vault)).sig("hasEnteredBefore(address)").with_key(who).checked_write(true);
     }
 
     /// @dev Phase-2: buy a growth rig (#2+) paying RAM (no BNB attached).

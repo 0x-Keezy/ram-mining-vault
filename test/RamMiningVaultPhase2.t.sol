@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, StdStorage, stdStorage} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {RamMiningBeaconFactory, RamMiningVaultUpgradeable} from "../src/RamMiningVault.sol";
 import {
@@ -10,7 +10,8 @@ import {
     InvalidUpgrade,
     UnexpectedValue,
     NothingToRepair,
-    TooManyRigs
+    TooManyRigs,
+    EntryRigMustBeMicro
 } from "../src/RamMiningVault.sol";
 
 contract P2MockToken is ERC20 {
@@ -70,6 +71,8 @@ contract P2MockRamOracle {
 
 /// @title Phase-2 economy suite (v3): two-phase payments, wear ladder, repair, upgrade, caged RAM pricing.
 contract RamMiningVaultPhase2Test is Test {
+    using stdStorage for StdStorage;
+
     address constant PORTAL = 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f;
     address constant GUARDIAN = 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950;
     address constant DEV = 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1;
@@ -126,10 +129,24 @@ contract RamMiningVaultPhase2Test is Test {
         reward.approve(address(vault), type(uint256).max);
     }
 
+    /// @dev v3 entry-gate: a fresh wallet may only buy plan 0 (Micro) with BNB. For any higher tier this
+    ///      helper performs the LEGAL post-gate flow — mark the wallet as already-entered (stdstore) and buy
+    ///      through the RAM path — so every scenario keeps the exact same rig (power/duration/id), the same
+    ///      clock and the same math, with no extra entry rig. RAM pricing is armed in setUp.
     function _buyBnb(address who, uint256 plan) internal {
+        if (plan != 0) {
+            _enter(who);
+            _buyRam(who, plan);
+            return;
+        }
         (uint256 price,,,) = vault.getPlan(plan);
         vm.prank(who);
         vault.buyMiningContract{value: price}(plan);
+    }
+
+    /// @dev Mark `who` as already-entered (the post-gate precondition), without minting an entry rig.
+    function _enter(address who) internal {
+        stdstore.target(address(vault)).sig("hasEnteredBefore(address)").with_key(who).checked_write(true);
     }
 
     function _buyRam(address who, uint256 plan) internal {
@@ -179,6 +196,64 @@ contract RamMiningVaultPhase2Test is Test {
         vm.prank(alice);
         vm.expectRevert(RamPricingNotArmed.selector);
         vault.buyMiningContract(0);
+    }
+
+    // ── entry gate (v3): a fresh wallet's BNB rig must be the Micro ─────
+    // Found in live testnet QA (2026-07-03): without this gate a fresh wallet bought the Hyper straight
+    // in BNB and never touched the RAM economy. High tiers must flow through the RAM sinks.
+
+    function testEntryGateRejectsEveryNonMicroFirstBuy() public {
+        for (uint256 plan = 1; plan < 4; plan++) {
+            (uint256 price,,,) = vault.getPlan(plan);
+            vm.prank(alice);
+            vm.expectRevert(EntryRigMustBeMicro.selector);
+            vault.buyMiningContract{value: price}(plan);
+        }
+        // nothing happened: the wallet is still fresh and holds no rigs
+        assertFalse(vault.hasEnteredBefore(alice));
+        (uint256 count,,,,) = vault.getUserMinerStats(alice);
+        assertEq(count, 0);
+        assertEq(vault.totalNativePaid(), 0);
+    }
+
+    function testEntryGateOverpayingDoesNotBypass() public {
+        // paying the Hyper price (or more) for a non-entry plan still reverts — the gate is on the plan,
+        // not on the amount
+        (uint256 hyperPrice,,,) = vault.getPlan(3);
+        vm.prank(alice);
+        vm.expectRevert(EntryRigMustBeMicro.selector);
+        vault.buyMiningContract{value: hyperPrice * 2}(3);
+    }
+
+    function testEntryGateMicroThenRamHyperIsTheIntendedPath() public {
+        assertEq(vault.ENTRY_PLAN_ID(), 0);
+        _buyBnb(alice, 0); // entry: Micro in BNB — the ONLY legal first buy
+        (uint256 hyperPrice,, uint256 hyperDuration,) = vault.getPlan(3);
+        uint256 units = _ramUnitsFor(hyperPrice); // growth: Hyper paid fully in RAM (20x base)
+        uint256 before = ram.balanceOf(alice);
+        _buyRam(alice, 3);
+        assertEq(ram.balanceOf(alice), before - units);
+        (uint256 count, uint256 power,,,) = vault.getUserMinerStats(alice);
+        assertEq(count, 2); // Micro (entry) + Hyper (growth)
+        assertEq(power, 10 + 420); // AUDITED table powers, untouched
+        // the Hyper carries its full audited duration
+        (,,,, uint256 endTime,,, bool active) = vault.getMiningContract(alice, 1);
+        assertTrue(active);
+        assertEq(endTime, block.timestamp + hyperDuration);
+    }
+
+    function testEntryGateUpgradeFromMicroStaysAvailable() public {
+        _buyBnb(alice, 0); // Micro entry
+        uint256 before = ram.balanceOf(alice);
+        (uint256 microPrice,,,) = vault.getPlan(0);
+        (uint256 corePrice,,,) = vault.getPlan(1);
+        vm.prank(alice);
+        vault.upgradeRig(0, 1); // evolve the entry rig itself: pay the Core-Micro difference in RAM
+        assertEq(ram.balanceOf(alice), before - _ramUnitsFor(corePrice - microPrice));
+        (, uint256 planId, uint256 power,,,,, bool active) = vault.getMiningContract(alice, 0);
+        assertTrue(active);
+        assertEq(planId, 1);
+        assertEq(power, 40);
     }
 
     function testEntryFlagPersistsAcrossExpiry() public {

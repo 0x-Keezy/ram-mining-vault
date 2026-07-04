@@ -59,14 +59,14 @@ contract DeployRamMiningUITest is Script {
         );
         RamMiningVaultUpgradeable vault = RamMiningVaultUpgradeable(payable(address(proxy)));
 
-        // 3) SEED the two-phase economy end-to-end:
-        //    rig #1 (Micro) in BNB — the entry; fund the "RAM" wallet; rig #2 (Mega) PAID IN RAM (85% burned);
-        //    then UPGRADE rig #1 Micro → Core (price difference in RAM, fresh wear ladder).
+        // 3) SEED the two-phase economy end-to-end, following the v3 ENTRY GATE (a fresh wallet may only
+        //    enter with the Micro in BNB — EntryRigMustBeMicro): Micro entry, then growth through the RAM
+        //    sinks (Hyper rig #2 paid in RAM, and an upgrade of the entry rig paying the RAM difference).
         tnvda.mint(DEPLOYER, 50_000e18);
         tnvda.approve(address(vault), type(uint256).max);
-        vault.buyMiningContract{value: basePriceWei * 3}(1); // rig #1: Core (BNB entry), power 40, 7d
+        vault.buyMiningContract{value: basePriceWei}(0); // rig #1: Micro (the ONLY legal BNB entry), power 10, 1d
         vault.buyMiningContract(3); // rig #2: Hyper in RAM, power 420, 90d (85% of the RAM burned)
-        vault.upgradeRig(0, 2); // rig #1 Core → Mega in RAM, power 130 fresh (lifetime unchanged)
+        vault.upgradeRig(0, 1); // rig #1 Micro → Core in RAM (diff price), power 40 fresh — lifetime stays 1d
 
         // 4) SEED rewards: donate — distributes pro-rata to the active (wear-decaying) power
         vault.donateReward(400e18);

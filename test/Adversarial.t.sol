@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, StdStorage, stdStorage} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {RamMiningBeaconFactory, RamMiningVaultUpgradeable} from "../src/RamMiningVault.sol";
 import {NothingToRepair, NothingToClaim} from "../src/RamMiningVault.sol";
@@ -62,6 +62,8 @@ contract AdvRamOracle {
 }
 
 contract AdversarialTest is Test {
+    using stdStorage for StdStorage;
+
     address constant PORTAL = 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f;
     address constant GUARDIAN = 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950;
     address constant DEV = 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1;
@@ -115,10 +117,24 @@ contract AdversarialTest is Test {
         reward.approve(address(vault), type(uint256).max);
     }
 
+    /// @dev v3 entry-gate: a fresh wallet may only buy plan 0 (Micro) with BNB. For any higher tier this
+    ///      helper performs the LEGAL post-gate flow — mark the wallet as already-entered (stdstore) and buy
+    ///      through the RAM path — so every scenario keeps the exact same rig (power/duration/id), the same
+    ///      clock and the same math, with no extra entry rig. RAM pricing is armed in setUp.
     function _buyBnb(address who, uint256 plan) internal {
+        if (plan != 0) {
+            _enter(who);
+            _buyRam(who, plan);
+            return;
+        }
         (uint256 price,,,) = vault.getPlan(plan);
         vm.prank(who);
         vault.buyMiningContract{value: price}(plan);
+    }
+
+    /// @dev Mark `who` as already-entered (the post-gate precondition), without minting an entry rig.
+    function _enter(address who) internal {
+        stdstore.target(address(vault)).sig("hasEnteredBefore(address)").with_key(who).checked_write(true);
     }
 
     function _buyRam(address who, uint256 plan) internal {
