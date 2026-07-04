@@ -56,7 +56,9 @@ contract RamMiningVaultForkTest is Test {
     // verified mainnet feeds (NVDA/USD provided by Flap 2026-06-30, verified on-chain: 8-dec, "NVDA / USD" ~$194.70;
     // BNB/USD = canonical Chainlink BSC aggregator, verified 8-dec "BNB / USD" ~$550, ~30s fresh).
     address constant NVDAB = 0x02Fca66C1D1aFB4E2A7884261eB00F63598a7436;
-    address constant NVDA_USD = 0xFfD9790a7D7AC20aFD2114Fef814a848F364E780;
+    // Flap's canonical NVDA/USD aggregator (Ondo + Chainlink + Pyth Pro), per stocks_factory_state.md.
+    // This is the feed the production vaultData will point rewardPriceFeed at (2026-07-04 decision).
+    address constant NVDA_USD = 0xea5c2Cbb5cD57daC24E26180b19a929F3E9699B8;
     address constant BNB_USD = 0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE;
 
     address constant MINER = address(0xA11CE);
