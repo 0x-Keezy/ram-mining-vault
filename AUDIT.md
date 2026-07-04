@@ -3,8 +3,17 @@
 This package is the source for the **v3 re-audit** requested by the Flap team ("if it is not covered in the previous audit, we need to perform another audit" — 2026-07-03). It is self-contained: sources, tests, pinned dependencies and build config.
 
 - **Audited base (previous audit):** branch `v2-keeper` @ `87847a4de8c7ed2e32a15624d69ced0797adc57c`
-- **Audit target (this package):** branch `v3-economy` @ `72d7d38302bc1c582287ef5005d6cd83e45fa330` (public repo: https://github.com/0x-Keezy/ram-mining-vault/tree/v3-economy — this ZIP adds only this AUDIT.md on top, zero code delta)
+- **Audit target (this package):** branch `v3-economy`, code @ `25e8f5a` (public repo: https://github.com/0x-Keezy/ram-mining-vault/tree/v3-economy — the branch head adds only this updated AUDIT.md on top, zero code delta)
 - **Contact:** Shilder (dev-lock wallet `0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1`), Telegram group `Shilder <> FLAP`
+
+## 0. v3.1 addendum — entry gate (found in our own live-testnet QA, disclosed proactively)
+
+One change landed after our re-review letter: **`EntryRigMustBeMicro` — a fresh wallet's first (BNB-paid) rig is now restricted to plan 0 (Micro)**, via a single `require`-style check + one custom error + one `public constant ENTRY_PLAN_ID = 0` (16 lines, `buyMiningContract` entry branch). Every later rig / upgrade / repair (any tier) flows through the RAM sinks unchanged.
+
+- **Why:** in live testnet QA a fresh wallet bought the top tier (Hyper, 90d) straight in BNB — one entry purchase yielded sustained top power without ever touching the RAM economy (85% burn / 15% treasury). The gate closes that bypass; the honest growth paths (rigs 2+ / upgrades, RAM-paid) are untouched.
+- **Charging logic unchanged:** the BNB entry branch's payment/refund logic is byte-identical apart from the added plan check before any state change; a reverted attempt leaves the wallet fully fresh (test-proven).
+- **The audited tier table is untouched** (powers/prices/durations); the gate is purchase *eligibility*, not re-numbering.
+- **Operating assumption to note:** with RAM pricing disarmed a fresh wallet can only ever hold 1-day Micros, so production launches arm the oracle + cage at creation via `vaultData` (already the plan; fields 6-8).
 
 ## 1. Scope of the diff to audit (v2-keeper → v3-economy)
 
@@ -12,7 +21,7 @@ This package is the source for the **v3 re-audit** requested by the Flap team ("
 
 | File | Change | What it is |
 |---|---|---|
-| `src/RamMiningVault.sol` | +844 / −209 lines | Phase-2 economy on top of the audited vault: two-phase payments (first rig per wallet in BNB — audited path unchanged; later rigs / upgrades / repairs in the RAM tax token, 85% burned to 0xdEaD + 15% to an immutable treasury wallet), time-only wear ladder implemented as partial sub-expirations on the audited bucket machinery, `repairRig`, `upgradeRig`, oracle-caged RAM pricing (disarmed until oracle + cage armed; over-charging is the fail-safe direction; the claim path never touches the oracle), `vaultData` extended to 9 fields, and the EIP-170 migration of all developer revert paths to custom errors (1:1 named after the old literal strings — approved by Flap 2026-07-03 given the bespoke UI). |
+| `src/RamMiningVault.sol` | +860 / −209 lines | Phase-2 economy on top of the audited vault: two-phase payments (first rig per wallet in BNB and restricted to the Micro entry plan — see §0; later rigs / upgrades / repairs in the RAM tax token, 85% burned to 0xdEaD + 15% to an immutable treasury wallet), time-only wear ladder implemented as partial sub-expirations on the audited bucket machinery, `repairRig`, `upgradeRig`, oracle-caged RAM pricing (disarmed until oracle + cage armed; over-charging is the fail-safe direction; the claim path never touches the oracle), `vaultData` extended to 9 fields, and the EIP-170 migration of all developer revert paths to custom errors (1:1 named after the old literal strings — approved by Flap 2026-07-03 given the bespoke UI). |
 | `src/RamPriceOracle.sol` | +502 lines (new) | Production RAM/BNB price oracle: curve-phase portal price → post-graduation truncated TWAP30×TWAP5 min-rule on the Pancake pair, with freshness / liquidity-floor / maturity gates; fail-safe to untrusted (vault then falls back to `cageMin` = most-units-charged). Includes the adversarial-review fix: symmetric truncation + anti-flash liquidity floor. |
 | `src/TestRamOracle.sol` | +30 lines (new) | Fixed-price mock oracle for testnet only. Not part of the production deployment. |
 
@@ -32,7 +41,7 @@ Size gate (run it — it is the pre-broadcast gate we use):
 forge build --sizes
 ```
 
-Expected: `RamMiningVaultUpgradeable` runtime ≈ 19.5 KB (EIP-170 margin ≈ +5 KB), `RamMiningBeaconFactory` initcode within EIP-3860, `RamPriceOracle` ≈ 5 KB.
+Expected: `RamMiningVaultUpgradeable` runtime 19,331 B (EIP-170 margin +5,245), `RamMiningBeaconFactory` initcode 28,410 B (EIP-3860 margin +20,742), `RamPriceOracle` ≈ 5 KB.
 
 ## 3. Tests
 
@@ -43,8 +52,8 @@ NVDAX_ADDRESS=0x02Fca66C1D1aFB4E2A7884261eB00F63598a7436 \
 forge test                          # full suite incl. BSC-mainnet fork tests
 ```
 
-Expected with RPC: **124 passed / 0 failed** across 9 files, including:
-- `test/RamMiningVaultPhase2.t.sol` — the Phase-2 economy (two-phase payments, wear ladder, repair, upgrade, treasury split)
+Expected with RPC: **129 passed / 0 failed** across 9 files, including:
+- `test/RamMiningVaultPhase2.t.sol` — the Phase-2 economy (two-phase payments, the v3.1 entry gate incl. overpay/underpay edges, wear ladder, repair, upgrade, treasury split)
 - `test/Adversarial.t.sol` — adversarial edges from our internal review (repair-in-wear-bucket, sequential repairs, claim→repair→claim double-count, last-day upgrade, multi-actor collapse to zero power with `Σ claimed ≤ Σ distributed`)
 - `test/RamPriceOracle.t.sol` + `test/RamPriceOracleAdversarial.t.sol` — oracle gates + the manipulation PoCs (spot +100% → oracle +8.33%; reseed 12.5× → 1.00×)
 - `test/RamMiningVault.fork.t.sol` + `test/RamPriceOracle.fork.t.sol` — against real BSC mainnet state (real NVDAB, real feeds, real Pancake pair)
