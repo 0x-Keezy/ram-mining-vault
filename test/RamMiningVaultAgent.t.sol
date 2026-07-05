@@ -76,6 +76,7 @@ contract RamMiningVaultAgentTest is Test {
     RamMiningVaultUpgradeable vault;
 
     uint256 basePrice = 0.001 ether;
+    uint256 basePriceUsd = 6e7; // $0.60 (8 dec) — calibrated to basePrice × mock BNB/USD ($600)
 
     function setUp() public {
         vm.chainId(97);
@@ -89,7 +90,7 @@ contract RamMiningVaultAgentTest is Test {
 
         uint256 seasonEnd = block.timestamp + 60 days;
         bytes memory vaultData =
-            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0, TREASURY);
+            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, basePriceUsd, seasonEnd, address(0), 0, 0, TREASURY);
         vm.prank(BNB_TESTNET_VAULT_PORTAL);
         vault = RamMiningVaultUpgradeable(payable(factory.newVault(RAM_TOKEN, address(0), 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1, vaultData)));
 

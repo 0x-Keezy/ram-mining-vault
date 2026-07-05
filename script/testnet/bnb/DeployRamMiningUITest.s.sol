@@ -23,6 +23,7 @@ contract DeployRamMiningUITest is Script {
 
     function run() external {
         uint256 basePriceWei = 0.001 ether;
+        uint256 basePriceUsd = 6e7; // $0.60 (8 dec) — calibrated to basePriceWei × the $600 mock BNB/USD feed
         uint256 seasonEnd = block.timestamp + 90 days; // > RIG_LIFE so rigs get the full 60d
         uint256 ramBnbPrice = 2e12; // 1 "RAM" (tnvda double-role) = 0.000002 BNB
 
@@ -49,6 +50,7 @@ contract DeployRamMiningUITest is Script {
                     address(nvdaUsdFeed),
                     address(bnbUsdFeed),
                     basePriceWei,
+                    basePriceUsd,
                     seasonEnd,
                     address(ramOracle),
                     ramBnbPrice / 2,
@@ -62,11 +64,11 @@ contract DeployRamMiningUITest is Script {
         // 3) SEED the two-phase economy end-to-end, following the v3 ENTRY GATE (a fresh wallet may only
         //    enter with the Micro in BNB — EntryRigMustBeMicro): Micro entry, then growth through the RAM
         //    sinks (Hyper rig #2 paid in RAM, and an upgrade of the entry rig paying the RAM difference).
-        tnvda.mint(DEPLOYER, 50_000e18);
+        tnvda.mint(DEPLOYER, 100_000e18); // v3.2 table: Hyper = $60 target here = 50,000 RAM + upgrade diff
         tnvda.approve(address(vault), type(uint256).max);
-        vault.buyMiningContract{value: basePriceWei}(0); // rig #1: Micro (the ONLY legal BNB entry), power 10, 1d
-        vault.buyMiningContract(3); // rig #2: Hyper in RAM, power 420, 90d (85% of the RAM burned)
-        vault.upgradeRig(0, 1); // rig #1 Micro → Core in RAM (diff price), power 40 fresh — lifetime stays 1d
+        vault.buyMiningContract{value: basePriceWei}(0); // rig #1: Micro (the ONLY legal BNB entry), power 100, 1d
+        vault.buyMiningContract(3); // rig #2: Hyper in RAM (USD-target), power 1065, 90d (85% of the RAM burned)
+        vault.upgradeRig(0, 1); // rig #1 Micro → Core in RAM (USD diff), power 400 fresh — lifetime stays 1d
 
         // 4) SEED rewards: donate — distributes pro-rata to the active (wear-decaying) power
         vault.donateReward(400e18);

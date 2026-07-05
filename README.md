@@ -8,7 +8,7 @@ RAM is a Flap tax token. Instead of buyback-and-burn, a share of its trading fee
 vault, used to acquire **tokenized NVIDIA (NVDAB)**, and distributed to "miners" in proportion to their
 **mining power**. You buy mining power ("rigs") and earn real tokenized NVIDIA. **Entry gate:** a
 fresh wallet's **first rig must be the Micro tier, paid in BNB** (`EntryRigMustBeMicro`); every
-subsequent rig, upgrade and repair is paid in **RAM** (the Phase-2 utility sink).
+subsequent rig, upgrade and repair is paid in **RAM at fixed USD targets** (the Phase-2 utility sink).
 
 - **Real yield** — rewards come from actual trading fees + a real asset, not from token emissions, so
   there is no "dry vault" risk.
@@ -21,17 +21,21 @@ subsequent rig, upgrade and repair is paid in **RAM** (the Phase-2 utility sink)
 
 - **Reward engine.** A MasterChef-style accumulator (`accRewardPerPower`) splits a variable,
   asynchronously-funded reward pool **pro-rata by each miner's power**. No inflation, no emission.
-- **Tier economics (disclosure).** The four rig tiers (Micro/Core/Mega/Hyper) reward capital **and
-  duration commitment**: longer / larger tiers earn proportionally more reward per BNB than the entry
-  tier (their `power × active-duration` per BNB is higher), so the tiers are **not equal on a
-  yield-per-BNB basis** — this is intentional, not a fairness guarantee across tiers. Every tier's
-  terms (power, duration, price) are public up-front via `getPlan`. A fresh wallet's **first**
-  purchase is hard-restricted to the **Micro** tier in BNB (`ENTRY_PLAN_ID` / `EntryRigMustBeMicro`);
+- **Tier economics (disclosure).** The four rig tiers (Micro/Core/Mega/Hyper) are priced to an
+  approximately **flat yield-per-$** with a mild **commitment premium**: wear-adjusted
+  `power × active-duration` per dollar is ~equal across the paid tiers, rising up to ~**+12%** for the
+  90-day Hyper (rewarding duration commitment — v3.2 deliberately rebalanced the table, resolving the
+  yield-per-BNB skew flagged in the original audit). The Micro is the **entry gate**, not a yield
+  vehicle. Every tier's terms are public up-front via `getPlan` (BNB reference) and `getPlanUsd`
+  (the fixed USD targets the RAM sinks charge). A fresh wallet's **first** purchase is
+  hard-restricted to the **Micro** tier in BNB (`ENTRY_PLAN_ID` / `EntryRigMustBeMicro`);
   higher tiers are bought as rig #2+ and paid in RAM. A rig's mining end is capped at
   `seasonEnd`, so a long tier bought mid-season earns only until the season ends. Post-RAM-launch
-  (Phase 2), subsequent rigs/upgrades are paid in RAM (BNB-denominated — the RAM cost is the tier's
-  BNB value converted to RAM units at the oracle's live BNB-per-RAM price), which rebalances scaling
-  incentives and introduces RAM's utility sink. A USD-denominated sink is a planned Phase-2 upgrade.
+  (Phase 2), subsequent rigs/upgrades/repairs are paid in RAM at **fixed USD targets**
+  (`basePriceUsd × 1/5/25/100`, 8-dec; converted USD → BNB via the hardened Chainlink BNB/USD feed,
+  then BNB → RAM units at the oracle's live price — a stale feed makes the growth purchase revert,
+  never mis-price), which rebalances scaling incentives and introduces RAM's utility sink. The entry
+  Micro stays BNB-priced (`basePriceWei`; no feed dependency in the entry path).
 - **Acquisition — keeper / RFQ (the standard Flap interface).** Tax fees arrive as BNB and accumulate in
   the vault. Instead of swapping on a DEX, the vault acquires NVDAB through a **permissionless keeper
   RFQ**: a keeper sells NVDAB **into** the vault and is paid BNB at the **Chainlink oracle price + a

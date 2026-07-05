@@ -26,10 +26,9 @@ interface IUniswapV2Factory {
 /// @notice Deployable as an immutable, admin-less, per-token instance. Implements `IRamPriceOracle`
 ///         (`pokeAndGetPrice`/`getPrice`) consumed by `RamMiningVault`: returns the price of `1e18` RAM in
 ///         wei of BNB plus a `trusted` flag. `trusted == false` means a reliability gate failed and the vault
-///         degrades to its guardian cage (safe OVER-charging direction for a burn sink). The vault charges this
-///         BNB-denominated price directly against its BNB-priced tiers; no USD conversion occurs in the RAM
-///         sink path — this contract is BNB-only by design. (USD-denominated pricing via the vault's hardened
-///         Chainlink BNB/USD feed is a planned Phase-2 upgrade.)
+///         degrades to its guardian cage (safe OVER-charging direction for a burn sink). USD conversion is done
+///         by the vault via its hardened Chainlink BNB/USD feed (the RAM sinks charge fixed USD targets) —
+///         this contract is BNB-only by design.
 ///
 /// @dev DESIGN (see RAM-pricing-ram-usd-oracle, red-team fixes 1–6 incorporated):
 ///      The golden rule — a market price is used ONLY when fresh + liquid + mature; otherwise DEGRADE.

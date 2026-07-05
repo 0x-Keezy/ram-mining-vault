@@ -48,16 +48,17 @@ contract RamMiningDeployTest is Test {
 
     function testFactoryReadback() public view {
         VaultDataSchema memory s = factory.vaultDataSchema();
-        assertEq(s.fields.length, 9);
+        assertEq(s.fields.length, 10);
         assertEq(s.fields[0].name, "rewardToken");
         assertEq(s.fields[1].name, "rewardPriceFeed");
         assertEq(s.fields[2].name, "bnbPriceFeed");
         assertEq(s.fields[3].name, "basePriceWei");
-        assertEq(s.fields[4].name, "seasonEnd");
-        assertEq(s.fields[5].name, "ramPriceOracle");
-        assertEq(s.fields[6].name, "ramCageMin");
-        assertEq(s.fields[7].name, "ramCageMax");
-        assertEq(s.fields[8].name, "ramTreasuryWallet");
+        assertEq(s.fields[4].name, "basePriceUsd");
+        assertEq(s.fields[5].name, "seasonEnd");
+        assertEq(s.fields[6].name, "ramPriceOracle");
+        assertEq(s.fields[7].name, "ramCageMin");
+        assertEq(s.fields[8].name, "ramCageMax");
+        assertEq(s.fields[9].name, "ramTreasuryWallet");
 
         assertTrue(factory.beacon() != address(0));
         assertTrue(factory.beaconImplementation() != address(0));
@@ -68,9 +69,11 @@ contract RamMiningDeployTest is Test {
 
     function testEndToEndLaunchAndFlow() public {
         uint256 basePrice = 0.001 ether;
+        uint256 basePriceUsd = 6e7; // $0.60 (8 dec) — calibrated to basePrice × mock BNB/USD ($600)
         uint256 seasonEnd = block.timestamp + 60 days;
-        bytes memory vaultData =
-            abi.encode(address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd, address(0), 0, 0, TREASURY);
+        bytes memory vaultData = abi.encode(
+            address(reward), address(nvdaFeed), address(bnbFeed), basePrice, basePriceUsd, seasonEnd, address(0), 0, 0, TREASURY
+        );
 
         // launch through the VaultPortal (as Flap would)
         vm.prank(BNB_TESTNET_VAULT_PORTAL);

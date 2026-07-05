@@ -98,7 +98,9 @@ error EntryRigMustBeMicro();
 
 /// @title RamMiningVaultUpgradeable
 /// @notice Flap V2 real-yield mining vault for the RAM project — KEEPER/RFQ model (v2).
-/// @dev Users buy native-BNB "rig" contracts that grant mining `power`. The vault's reward comes from REAL
+/// @dev Users enter with a native-BNB Micro rig (the per-wallet entry gate); growth tiers/upgrades/repairs are
+///      paid in the RAM tax token at FIXED USD targets (8-dec, `basePriceUsd × multiplier`, converted via the
+///      hardened Chainlink BNB/USD feed + the RAM price oracle). Rigs grant mining `power`. The vault's reward comes from REAL
 ///      trading fees: the RAM tax token routes its `market` fee share (in BNB) to this vault. Instead of swapping
 ///      BNB on a DEX (v1), a keeper sells the reward token (tokenized NVIDIA, NVDAB) INTO the vault at the
 ///      Chainlink oracle price plus a small, clamped premium (`sellRWAToVault`): the vault pays BNB and
@@ -247,14 +249,21 @@ contract RamMiningVaultUpgradeable is
     uint256 public totalRamTreasuryPaid; // lifetime 15% treasury share of RAM sink payments (paid to ramTreasuryWallet)
     uint256 public totalRamPaid; // lifetime RAM received through sinks
     uint256 public totalRamBurned; // lifetime RAM burned to RAM_BURN_ADDR
+    /// @dev USD target for the Micro tier, 8 decimals (Chainlink-style). Growth-tier RAM sinks charge
+    ///      `basePriceUsd × plan multiplier` (×1/×5/×25/×100), converted USD → BNB via the hardened Chainlink
+    ///      BNB/USD feed and BNB → RAM units via the RAM price oracle + cage. The ENTRY rig stays priced in BNB
+    ///      (`basePriceWei`, no feed in the entry path); the launcher calibrates `basePriceWei ≈ basePriceUsd/bnbUsd`
+    ///      on launch day so both tables agree at t0 (only the entry's BNB sticker drifts afterwards — disclosed).
+    uint256 public basePriceUsd;
 
     /// @dev Storage gap for safe future upgrades (append-only): when adding new state vars, append them and
     ///      shrink this gap so the beacon-proxy storage layout never collides. v2 is a fresh deployment
     ///      (new beacon implementation), so this reflects the new layout, not an upgrade-in-place of v1.
-    ///      v3 appended 8 slots (Phase-2 economy) → gap shrunk 44 → 36. NOTE: the Rig struct gained fields, which
+    ///      v3 appended 8 slots (Phase-2 economy) → gap shrunk 44 → 36. v3.2 appended `basePriceUsd` (USD-target
+    ///      sink) → gap shrunk 35 → 34. NOTE: the Rig struct gained fields, which
     ///      is safe ONLY because v3 deploys as a FRESH beacon implementation for NEW vaults (never an in-place
     ///      upgrade of a live v2 vault's storage).
-    uint256[35] private __gap;
+    uint256[34] private __gap;
 
     event RigBought(
         address indexed user,
@@ -297,6 +306,7 @@ contract RamMiningVaultUpgradeable is
         address _rewardPriceFeed,
         address _bnbPriceFeed,
         uint256 _basePriceWei,
+        uint256 _basePriceUsd,
         uint256 _seasonEnd,
         address _ramPriceOracle,
         uint256 _ramCageMin,
@@ -313,6 +323,9 @@ contract RamMiningVaultUpgradeable is
         if (!(AggregatorV3Interface(_rewardPriceFeed).decimals() == 8)) revert BadFeedDecimals();
         if (!(AggregatorV3Interface(_bnbPriceFeed).decimals() == 8)) revert BadFeedDecimals();
         if (!(_basePriceWei > 0)) revert BadConfig();
+        // v3.2: the growth-tier RAM sinks charge USD targets (8-dec), so the USD base price is fundamental
+        // config, exactly like the BNB entry price — zero would brick every rig #2+/repair/upgrade quote.
+        if (!(_basePriceUsd > 0)) revert BadConfig();
         if (!(_seasonEnd >= block.timestamp + 1 days)) revert SeasonTooShort();
 
         taxToken = _taxToken;
@@ -320,6 +333,7 @@ contract RamMiningVaultUpgradeable is
         rewardPriceFeed = _rewardPriceFeed;
         bnbPriceFeed = _bnbPriceFeed;
         basePriceWei = _basePriceWei;
+        basePriceUsd = _basePriceUsd;
         seasonEnd = _seasonEnd;
         lastSettledBucket = block.timestamp / BUCKET;
 
@@ -369,8 +383,9 @@ contract RamMiningVaultUpgradeable is
 
     /// @notice Buy a mining rig. Phase-2 two-phase economy: the FIRST rig of a wallet is paid in native BNB
     ///         and MUST be the entry plan (Micro, `ENTRY_PLAN_ID`) — the honest per-wallet Sybil limiter, not a
-    ///         bypass of the RAM economy; every later rig (any tier) is paid in the RAM tax token, converted
-    ///         from the plan's BNB price via the RAM price oracle (85% burned / 15% treasury).
+    ///         bypass of the RAM economy; every later rig (any tier) is paid in the RAM tax token, charged at the
+    ///         plan's FIXED USD target (`basePriceUsd × multiplier`, 8 dec) converted USD → BNB via the hardened
+    ///         Chainlink BNB/USD feed and BNB → RAM units via the RAM price oracle (85% burned / 15% treasury).
     ///         Rigs keep their AUDITED per-plan durations (season-capped) and wear 5% every 3 days to a 47% floor.
     function buyMiningContract(uint256 planId) external payable nonReentrant {
         if (!(planId < PLAN_COUNT)) revert InvalidPlan();
@@ -412,9 +427,10 @@ contract RamMiningVaultUpgradeable is
             }
             totalNativePaid += priceWei;
         } else {
-            // ── growth rig: RAM path (Phase-2). No BNB accepted here — the plan price converts to RAM units. ──
+            // ── growth rig: RAM path (Phase-2). No BNB accepted here — the plan's fixed USD target converts
+            // to RAM units (USD → BNB via the BNB/USD feed, BNB → RAM via the oracle+cage). ──
             if (msg.value != 0) revert UnexpectedValue();
-            ramPaid = _chargeRam(priceWei);
+            ramPaid = _chargeRamUsd(_planUsd(planId));
         }
 
         lastContractId += 1;
@@ -478,21 +494,23 @@ contract RamMiningVaultUpgradeable is
         Rig storage r = rigs[index];
         if (!(block.timestamp < r.endTime && block.timestamp / BUCKET < r.endBucket)) revert RigExpired();
 
-        (uint256 planPrice, uint256 planPower, uint256 planDuration,) = _plan(r.planId);
+        (, uint256 planPower, uint256 planDuration,) = _plan(r.planId);
         uint256 capBps = BPS_DENOM - ((block.timestamp - r.startTime) * REPAIR_AGE_PENALTY_BPS) / planDuration;
         uint256 restored = (planPower * capBps) / BPS_DENOM;
         uint256 floorLvl = _floorLevel(r.planId);
         if (restored < floorLvl) restored = floorLvl;
         if (!(restored > _rigCurrentPower(r))) revert NothingToRepair();
 
-        uint256 ramPaid = _chargeRam((planPrice * repairCostBps) / BPS_DENOM);
+        // v3.2: repair charges `repairCostBps` of the plan's fixed USD target (not its BNB reference).
+        uint256 ramPaid = _chargeRamUsd((_planUsd(r.planId) * repairCostBps) / BPS_DENOM);
         _reschedule(r, restored, r.planId);
         emit RigRepaired(msg.sender, r.id, ramPaid, restored);
     }
 
-    /// @notice Upgrade a live rig to a higher tier: pay the plan-price DIFFERENCE in RAM (85% burned). The rig
-    ///         becomes the new tier at full power with a FRESH wear ladder (new hardware), but its lifetime
-    ///         (ORIGINAL plan duration from mint) is NEVER extended — no buying a 1d Micro to smuggle a 90d Hyper.
+    /// @notice Upgrade a live rig to a higher tier: pay the USD-target DIFFERENCE between the two plans in RAM
+    ///         (85% burned). The rig becomes the new tier at full power with a FRESH wear ladder (new hardware),
+    ///         but its lifetime (ORIGINAL plan duration from mint) is NEVER extended — no buying a 1d Micro to
+    ///         smuggle a 90d Hyper.
     function upgradeRig(uint256 index, uint256 newPlanId) external nonReentrant {
         if (!(newPlanId < PLAN_COUNT)) revert InvalidPlan();
         _settleExpiries();
@@ -502,20 +520,27 @@ contract RamMiningVaultUpgradeable is
         if (!(block.timestamp < r.endTime && block.timestamp / BUCKET < r.endBucket)) revert RigExpired();
         if (!(newPlanId > r.planId)) revert InvalidUpgrade();
 
-        (uint256 oldPrice,,,) = _plan(r.planId);
-        (uint256 newPrice, uint256 newPower,,) = _plan(newPlanId);
-        uint256 ramPaid = _chargeRam(newPrice - oldPrice);
+        (, uint256 newPower,,) = _plan(newPlanId);
+        uint256 ramPaid = _chargeRamUsd(_planUsd(newPlanId) - _planUsd(r.planId));
         _reschedule(r, newPower, newPlanId);
         emit RigUpgraded(msg.sender, r.id, newPlanId, ramPaid, newPower);
     }
 
-    /// @dev Charge a BNB-denominated cost in RAM units through the oracle+cage price, split 85% burn (to
-    ///      RAM_BURN_ADDR) / 15% to the dedicated, immutable treasury wallet (same tx). Delta-measured so a
+    /// @dev Charge a USD-denominated cost (8 decimals, Chainlink-style) in RAM units, split 85% burn (to
+    ///      RAM_BURN_ADDR) / 15% to the dedicated, immutable treasury wallet (same tx). Conversion is two-step:
+    ///      USD → BNB via the hardened Chainlink BNB/USD feed (`_readFeed` — HARD staleness check, so a
+    ///      stale/dead feed REVERTS the growth purchase: fail-closed, never a mis-priced sink; BNB/USD updates
+    ///      24/7 and `bnbFeedMaxStale` is clamped ≤ 1d, so the liveness risk is minimal and claims + the BNB
+    ///      entry rig are never affected), then BNB → RAM units via the oracle+cage price. Delta-measured so a
     ///      taxed/fee-on-transfer path can't corrupt accounting. Reverts only when the RAM pricing is not armed
-    ///      (safe-by-default) or nothing arrives.
-    function _chargeRam(uint256 bnbCost) internal returns (uint256 received) {
+    ///      (safe-by-default), the BNB/USD feed is stale, or nothing arrives.
+    ///      units = usdCost·1e36 / (bnbUsd·price): usdCost 8-dec, bnbUsd 8-dec, price = BNB wei per 1e18 RAM →
+    ///      the 8-dec factors cancel and 1e36 = 1e18 (wei) · 1e18 (RAM base units). Max realistic usdCost ~1e11
+    ///      (Hyper $1,000 = 1e11) → 1e11·1e36 = 1e47 ≪ 2^256, no overflow.
+    function _chargeRamUsd(uint256 usdCost) internal returns (uint256 received) {
+        uint256 bnbUsd = _readFeed(bnbPriceFeed, bnbFeedMaxStale); // 8 dec; reverts on stale/bad (fail-closed)
         uint256 price = _cagedRamPrice(true);
-        uint256 units = (bnbCost * 1e18) / price;
+        uint256 units = (usdCost * 1e36) / (bnbUsd * price);
         if (!(units > 0)) revert ZeroAmount();
 
         IERC20 ram = IERC20(taxToken);
@@ -584,24 +609,32 @@ contract RamMiningVaultUpgradeable is
         return (p, true);
     }
 
-    /// @notice Quote a rig purchase (rig #2+) in RAM units at the current caged price.
-    function quoteRigInRam(uint256 planId) external view returns (uint256 ramUnits, bool trusted) {
-        (uint256 priceWei,,,) = _plan(planId);
+    /// @dev View twin of the `_chargeRamUsd` conversion for quoting: USD (8 dec) → RAM units at the live
+    ///      BNB/USD feed + the caged RAM price. `trusted` mirrors `_cagedRamPriceView` (false = cage floor in
+    ///      use). NOTE: like the charge path, a stale/bad BNB/USD feed makes the quote REVERT (StaleFeed) —
+    ///      honest by design: the purchase itself would revert identically, so no quote is shown for a
+    ///      purchase that cannot execute. The dapp humanizes the revert.
+    function _usdToRamView(uint256 usdCost) internal view returns (uint256 ramUnits, bool trusted) {
+        uint256 bnbUsd = _readFeed(bnbPriceFeed, bnbFeedMaxStale); // 8 dec; reverts on stale/bad
         uint256 price;
         (price, trusted) = _cagedRamPriceView();
-        ramUnits = (priceWei * 1e18) / price;
+        ramUnits = (usdCost * 1e36) / (bnbUsd * price);
     }
 
-    /// @notice Quote a repair of `user`'s rig at `index` in RAM units at the current caged price.
+    /// @notice Quote a rig purchase (rig #2+) in RAM units: the plan's fixed USD target at the current
+    ///         BNB/USD feed + caged RAM price. Reverts StaleFeed if the BNB/USD feed is stale (the buy would too).
+    function quoteRigInRam(uint256 planId) external view returns (uint256 ramUnits, bool trusted) {
+        (ramUnits, trusted) = _usdToRamView(_planUsd(planId));
+    }
+
+    /// @notice Quote a repair of `user`'s rig at `index` in RAM units (repairCostBps of the plan's USD target).
     function quoteRepairInRam(address user, uint256 index) external view returns (uint256 ramUnits, bool trusted) {
         if (!(index < userRigs[user].length)) revert BadIndex();
-        (uint256 planPrice,,,) = _plan(userRigs[user][index].planId);
-        uint256 price;
-        (price, trusted) = _cagedRamPriceView();
-        ramUnits = (((planPrice * repairCostBps) / BPS_DENOM) * 1e18) / price;
+        (ramUnits, trusted) =
+            _usdToRamView((_planUsd(userRigs[user][index].planId) * repairCostBps) / BPS_DENOM);
     }
 
-    /// @notice Quote a tier upgrade of `user`'s rig at `index` to `newPlanId` in RAM units.
+    /// @notice Quote a tier upgrade of `user`'s rig at `index` to `newPlanId` in RAM units (USD-target difference).
     function quoteUpgradeInRam(address user, uint256 index, uint256 newPlanId)
         external
         view
@@ -611,11 +644,7 @@ contract RamMiningVaultUpgradeable is
         if (!(newPlanId < PLAN_COUNT)) revert InvalidPlan();
         uint256 oldPlanId = userRigs[user][index].planId;
         if (!(newPlanId > oldPlanId)) revert InvalidUpgrade();
-        (uint256 oldPrice,,,) = _plan(oldPlanId);
-        (uint256 newPrice,,,) = _plan(newPlanId);
-        uint256 price;
-        (price, trusted) = _cagedRamPriceView();
-        ramUnits = ((newPrice - oldPrice) * 1e18) / price;
+        (ramUnits, trusted) = _usdToRamView(_planUsd(newPlanId) - _planUsd(oldPlanId));
     }
 
     /// @dev Single accounting+transfer claim path. Effects (rewardDebt/claimed) are mutated BEFORE the one and
@@ -1073,6 +1102,13 @@ contract RamMiningVaultUpgradeable is
         (priceWei, power, durationSeconds, name) = _plan(planId);
     }
 
+    /// @notice The plan's fixed USD target (8 decimals, Chainlink-style) — what the RAM sinks actually charge
+    ///         for rig #2+/upgrades (and the base of repair quotes). The entry Micro is charged in BNB
+    ///         (`getPlan().priceWei`); this view lets UIs display stable dollar stickers for the growth tiers.
+    function getPlanUsd(uint256 planId) external view returns (uint256 priceUsd) {
+        priceUsd = _planUsd(planId);
+    }
+
     function getVaultMiningStats()
         external
         view
@@ -1413,28 +1449,50 @@ contract RamMiningVaultUpgradeable is
     //  Plans
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// @dev AUDITED tier table — UNCHANGED from the v2 contract Flap reviewed. Per our F2 "By Design"
-    ///      response to the Flap Risk Report, the four Genesis tiers (powers, prices AND durations) are
-    ///      deliberately NOT rebalanced: the yield-per-BNB spread is publicly disclosed via getPlan, bounded
-    ///      by the seasonEnd cap (end = min(start + duration, seasonEnd)), and Phase 2 rebalances scaling
-    ///      incentives ECONOMICALLY (subsequent rigs/upgrades/repairs are paid in RAM) — not by re-numbering
-    ///      the audited table. The v3 wear ladder operates WITHIN each rig's own audited duration.
+    /// @dev v3.2 tier table — REBALANCED to approximately flat yield-per-$ with a mild commitment premium
+    ///      (wear-adjusted power-days per $: Core 50.4 / Mega 53.2 / Hyper 56.6 → up to ~+12% for the 90-day
+    ///      tier), deliberately resolving the yield-per-BNB skew flagged in the original audit (F2): under the
+    ///      old ×1/×3/×8/×20 table the top tier bought power-days ~13× cheaper per $ (wear-adjusted) than the
+    ///      Core, which the economic review found unsustainable for a shared pro-rata pool. Durations are
+    ///      UNCHANGED (1d/7d/30d/90d, season-capped); the Micro stays the BNB entry gate (not a yield vehicle).
+    ///      Every tier's terms remain public up-front via `getPlan` (BNB reference) and `getPlanUsd` (the fixed
+    ///      USD targets the RAM sinks actually charge). The v3 wear ladder operates WITHIN each rig's duration.
     function _plan(uint256 planId)
         internal
         view
         returns (uint256 priceWei, uint256 power, uint256 durationSeconds, string memory name)
     {
-        if (!(planId < PLAN_COUNT)) revert InvalidPlan();
+        priceWei = basePriceWei * _planMult(planId); // _planMult validates planId
         if (planId == 0) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei, 10, 1 days, "Micro Rig");
+            (power, durationSeconds, name) = (100, 1 days, "Micro Rig");
         } else if (planId == 1) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 3, 40, 7 days, "Core Rig");
+            (power, durationSeconds, name) = (400, 7 days, "Core Rig");
         } else if (planId == 2) {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 8, 130, 30 days, "Mega Rig");
+            (power, durationSeconds, name) = (560, 30 days, "Mega Rig");
         } else {
-            (priceWei, power, durationSeconds, name) = (basePriceWei * 20, 420, 90 days, "Hyper Rig");
+            (power, durationSeconds, name) = (1065, 90 days, "Hyper Rig");
         }
         if (!(priceWei > 0 && power > 0 && durationSeconds > 0)) revert BadPlanParams();
+    }
+
+    /// @dev Single source of truth for the tier price multipliers (×1/×5/×25/×100), shared by the BNB
+    ///      reference table (`_plan` → `basePriceWei × mult`) and the USD sink targets (`_planUsd` →
+    ///      `basePriceUsd × mult`) so the two tables can never drift in shape.
+    function _planMult(uint256 planId) internal pure returns (uint256 mult) {
+        if (!(planId < PLAN_COUNT)) revert InvalidPlan();
+        if (planId == 0) return 1;
+        if (planId == 1) return 5;
+        if (planId == 2) return 25;
+        return 100;
+    }
+
+    /// @dev The plan's fixed USD target (8 decimals): `basePriceUsd × {1,5,25,100}` — the SAME multipliers as
+    ///      the BNB reference table, so both tables agree at t0 when the launcher calibrates
+    ///      `basePriceWei ≈ basePriceUsd / bnbUsd`. This is what the RAM sinks (rig #2+/repair/upgrade)
+    ///      actually charge; only the entry Micro is charged in BNB (`_plan().priceWei`).
+    function _planUsd(uint256 planId) internal view returns (uint256 priceUsd) {
+        priceUsd = basePriceUsd * _planMult(planId);
+        if (!(priceUsd > 0)) revert BadPlanParams();
     }
 }
 
@@ -1460,10 +1518,13 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
         beacon = address(new UpgradeableBeacon(address(impl)));
     }
 
-    /// @dev vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd,
-    ///      ramPriceOracle, ramCageMin, ramCageMax, ramTreasuryWallet). Fields 6-8 arm the Phase-2 RAM sink
-    ///      pricing at creation (zeros = disarmed; the Guardian can arm/adjust later); field 9 is the dedicated
-    ///      treasury wallet receiving the 15% share of RAM sinks (required non-zero, immutable per vault).
+    /// @dev vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, basePriceUsd,
+    ///      seasonEnd, ramPriceOracle, ramCageMin, ramCageMax, ramTreasuryWallet). `basePriceUsd` (8 dec) sets
+    ///      the FIXED USD targets the RAM sinks charge (`× 1/5/25/100` per tier); the launcher calibrates
+    ///      `basePriceWei ≈ basePriceUsd / bnbUsd` on launch day so the BNB entry price and the USD table agree
+    ///      at t0. Fields 7-9 arm the Phase-2 RAM sink pricing at creation (zeros = disarmed; the Guardian can
+    ///      arm/adjust later); field 10 is the dedicated treasury wallet receiving the 15% share of RAM sinks
+    ///      (required non-zero, immutable per vault).
     function newVault(address taxToken, address, address creator, bytes calldata vaultData)
         external
         override
@@ -1476,12 +1537,15 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
             address rewardPriceFeed,
             address bnbPriceFeed,
             uint256 basePriceWei,
+            uint256 basePriceUsd,
             uint256 seasonEnd,
             address ramPriceOracle,
             uint256 ramCageMin,
             uint256 ramCageMax,
             address ramTreasuryWallet
-        ) = abi.decode(vaultData, (address, address, address, uint256, uint256, address, uint256, uint256, address));
+        ) = abi.decode(
+            vaultData, (address, address, address, uint256, uint256, uint256, address, uint256, uint256, address)
+        );
 
         vault = address(
             new BeaconProxy(
@@ -1494,6 +1558,7 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
                         rewardPriceFeed,
                         bnbPriceFeed,
                         basePriceWei,
+                        basePriceUsd,
                         seasonEnd,
                         ramPriceOracle,
                         ramCageMin,
@@ -1566,16 +1631,20 @@ contract RamMiningBeaconFactory is VaultFactoryBaseV2 {
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
         schema.description =
             "Launch a RAM Mining Vault. Users buy BNB rig contracts to earn tokenized NVIDIA, acquired from keepers at the Chainlink oracle price plus a small clamped premium and funded by the RAM token's real trading fees, shared by mining power. Provide the reward token (NVDAB), the NVDA/USD and BNB/USD Chainlink feeds, the Micro rig base price, and the season end.";
-        schema.fields = new FieldDescriptor[](9);
+        schema.fields = new FieldDescriptor[](10);
         schema.fields[0] = FieldDescriptor("rewardToken", "address", "Tokenized NVIDIA reward token (NVDAB)", 0);
         schema.fields[1] = FieldDescriptor("rewardPriceFeed", "address", "Chainlink NVDA/USD price feed (8 dec)", 0);
         schema.fields[2] = FieldDescriptor("bnbPriceFeed", "address", "Chainlink BNB/USD price feed (8 dec)", 0);
-        schema.fields[3] = FieldDescriptor("basePriceWei", "uint256", "Base price for Micro Rig in BNB", 18);
-        schema.fields[4] = FieldDescriptor("seasonEnd", "time", "Mining season end timestamp", 0);
-        schema.fields[5] = FieldDescriptor("ramPriceOracle", "address", "RAM price oracle (0 = RAM sinks disarmed)", 0);
-        schema.fields[6] = FieldDescriptor("ramCageMin", "uint256", "RAM price cage floor, BNB wei per 1e18 RAM", 18);
-        schema.fields[7] = FieldDescriptor("ramCageMax", "uint256", "RAM price cage ceiling, BNB wei per 1e18 RAM", 18);
-        schema.fields[8] = FieldDescriptor("ramTreasuryWallet", "address", "Treasury wallet for the 15% RAM sink share", 0);
+        schema.fields[3] = FieldDescriptor("basePriceWei", "uint256", "Base price for Micro Rig in BNB (entry gate)", 18);
+        schema.fields[4] = FieldDescriptor(
+            "basePriceUsd", "uint256", "USD target for the Micro tier, 8 dec (RAM sinks charge x1/x5/x25/x100)", 8
+        );
+        schema.fields[5] = FieldDescriptor("seasonEnd", "time", "Mining season end timestamp", 0);
+        schema.fields[6] = FieldDescriptor("ramPriceOracle", "address", "RAM price oracle (0 = RAM sinks disarmed)", 0);
+        schema.fields[7] = FieldDescriptor("ramCageMin", "uint256", "RAM price cage floor, BNB wei per 1e18 RAM", 18);
+        schema.fields[8] = FieldDescriptor("ramCageMax", "uint256", "RAM price cage ceiling, BNB wei per 1e18 RAM", 18);
+        schema.fields[9] =
+            FieldDescriptor("ramTreasuryWallet", "address", "Treasury wallet for the 15% RAM sink share", 0);
         schema.isArray = false;
     }
 }

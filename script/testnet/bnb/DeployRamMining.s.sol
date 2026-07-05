@@ -13,7 +13,8 @@ import {TestPriceFeed} from "src/TestPriceFeed.sol";
 ///         using the factory address + the v2 `vaultData` logged below.
 ///
 /// @dev THE DEPLOYER PRIVATE KEY MUST BE TREATED AS BURNED — testnet only, never reuse for mainnet/funds.
-///      v2 vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, seasonEnd).
+///      v3.2 vaultData = abi.encode(rewardToken, rewardPriceFeed, bnbPriceFeed, basePriceWei, basePriceUsd,
+///      seasonEnd, ramPriceOracle, ramCageMin, ramCageMax, ramTreasuryWallet).
 ///      Usage (run by the user with a funded testnet wallet):
 ///
 ///      forge script script/testnet/bnb/DeployRamMining.s.sol:DeployRamMining \
@@ -36,8 +37,10 @@ contract DeployRamMining is Script {
 
         vm.stopBroadcast();
 
-        // suggested launch params for Flap (basePrice 0.001 BNB, 60-day season)
+        // suggested launch params for Flap (basePrice 0.001 BNB, $0.60 USD-target calibrated to the $600 mock
+        // BNB/USD feed so both tier tables agree at t0, 60-day season)
         uint256 basePriceWei = 0.001 ether;
+        uint256 basePriceUsd = 6e7; // 8 dec — v3.2 USD-target base for the RAM sinks (x1/x5/x25/x100)
         uint256 seasonEnd = block.timestamp + 60 days;
 
         console.log("=== RAM Mining testnet deploy (keeper/RFQ v2) ===");
@@ -52,6 +55,7 @@ contract DeployRamMining is Script {
         console.log("rewardPriceFeed:", address(nvdaUsdFeed));
         console.log("bnbPriceFeed:   ", address(bnbUsdFeed));
         console.log("basePriceWei:   ", basePriceWei);
+        console.log("basePriceUsd:   ", basePriceUsd);
         console.log("seasonEnd:      ", seasonEnd);
     }
 }

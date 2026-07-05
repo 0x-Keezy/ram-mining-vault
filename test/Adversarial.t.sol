@@ -84,6 +84,7 @@ contract AdversarialTest is Test {
     RamMiningVaultUpgradeable vault;
 
     uint256 basePrice = 0.001 ether;
+    uint256 basePriceUsd = 6e7; // $0.60 (8 dec) — calibrated to basePrice × mock BNB/USD ($600), tables agree at t0
     uint256 seasonEnd;
 
     function setUp() public {
@@ -99,7 +100,7 @@ contract AdversarialTest is Test {
         seasonEnd = block.timestamp + 300 days; // long season: no season-cap interference
         oracle.set(RAM_BNB_PRICE, true);
         bytes memory vd = abi.encode(
-            address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd,
+            address(reward), address(nvdaFeed), address(bnbFeed), basePrice, basePriceUsd, seasonEnd,
             address(oracle), CAGE_MIN, CAGE_MAX, address(0x7E57)
         );
         vm.prank(PORTAL);
@@ -157,20 +158,20 @@ contract AdversarialTest is Test {
     //  read `live` as post-step. A double-count or a lost delta shows up as a
     //  global-power mismatch or a wrong restored level.
     function testRepairInSameBucketAsStep() public {
-        _buyBnb(alice, 3); // Hyper 420, steps at 103d, 106d, 109d ...
-        vault.donateReward(420 ether); // pending accrues at full power pre-step
+        _buyBnb(alice, 3); // Hyper 1065, steps at 103d, 106d, 109d ...
+        vault.donateReward(1065 ether); // pending accrues at full power pre-step
 
-        vm.warp(106 days); // land EXACTLY on the 2nd step bucket → live = 379
-        assertEq(_cur(alice, 0), 379, "pre-repair live must be the 2-step level");
+        vm.warp(106 days); // land EXACTLY on the 2nd step bucket → live = 960
+        assertEq(_cur(alice, 0), 960, "pre-repair live must be the 2-step level");
 
         uint256 pendingBefore = vault.pendingRewards(alice);
 
         vm.prank(alice);
         vault.repairRig(0);
 
-        // age 6d of 90d → penalty 3000*6/90 = 200 bps → cap 98% → restored = 420*0.98 = 411.6 → 411
-        assertEq(_cur(alice, 0), 411, "restored level wrong at a step-bucket repair");
-        assertEq(_globalPower(), 411, "global power must equal the single rig's restored level");
+        // age 6d of 90d → penalty 3000*6/90 = 200 bps → cap 98% → restored = 1065*0.98 = 1043.7 → 1043
+        assertEq(_cur(alice, 0), 1043, "restored level wrong at a step-bucket repair");
+        assertEq(_globalPower(), 1043, "global power must equal the single rig's restored level");
         // pending was checkpointed into accrued, not lost, not doubled
         assertApproxEqAbs(vault.pendingRewards(alice), pendingBefore, 1e6, "pending must survive the repair");
 
@@ -183,22 +184,22 @@ contract AdversarialTest is Test {
 
     // ── B. Two repairs at different worn points (unregister/re-register twice) ─
     function testTwoRepairsInSequence() public {
-        _buyBnb(alice, 3); // Hyper 420
+        _buyBnb(alice, 3); // Hyper 1065
 
-        vm.warp(112 days); // 4 steps → 342
-        assertEq(_cur(alice, 0), 342);
+        vm.warp(112 days); // 4 steps → 866
+        assertEq(_cur(alice, 0), 866);
         vm.prank(alice);
-        vault.repairRig(0); // age 12d → cap 96% → 403
-        assertEq(_cur(alice, 0), 403);
-        assertEq(_globalPower(), 403);
+        vault.repairRig(0); // age 12d → cap 96% → 1022
+        assertEq(_cur(alice, 0), 1022);
+        assertEq(_globalPower(), 1022);
 
         vm.warp(130 days); // wear the fresh ladder again (wearStart=112d): steps at 115,118,121,124,127,130
         uint256 worn = _cur(alice, 0);
-        assertLt(worn, 403, "rig should have worn after the first repair");
+        assertLt(worn, 1022, "rig should have worn after the first repair");
         vm.prank(alice);
-        vault.repairRig(0); // age 30d of 90d → cap 90% → 378
-        assertEq(_cur(alice, 0), 378, "second repair restored level wrong");
-        assertEq(_globalPower(), 378, "global power diverged after 2 repairs");
+        vault.repairRig(0); // age 30d of 90d → cap 90% → 1065*0.90 = 958.5 → 958
+        assertEq(_cur(alice, 0), 958, "second repair restored level wrong");
+        assertEq(_globalPower(), 958, "global power diverged after 2 repairs");
 
         vm.warp(191 days);
         vault.donateReward(1);
@@ -246,18 +247,18 @@ contract AdversarialTest is Test {
         assertTrue(_cur(alice, 0) > 0, "must be alive on day 6");
 
         vm.prank(alice);
-        vault.upgradeRig(0, 3); // → Hyper 420 for the last day only
+        vault.upgradeRig(0, 3); // → Hyper 1065 for the last day only
 
         (uint256 id, uint256 planId, uint256 power,,,,, bool active) = vault.getMiningContract(alice, 0);
         assertEq(planId, 3);
-        assertEq(power, 420, "fresh Hyper power on the last day");
+        assertEq(power, 1065, "fresh Hyper power on the last day");
         assertTrue(active);
-        assertEq(_globalPower(), 420);
+        assertEq(_globalPower(), 1065);
         (,,,, uint256 lifeEnds1,) = vault.getRigWear(alice, 0);
         assertEq(lifeEnds1, lifeEnds0, "upgrade must NOT extend the original Core life");
         assertEq(id, 1);
 
-        // one day later it dies; power must vanish cleanly (the 420 remainder was booked at endBucket)
+        // one day later it dies; power must vanish cleanly (the 1065 remainder was booked at endBucket)
         vm.warp(107 days);
         vault.donateReward(1);
         assertEq(_globalPower(), 0, "orphan power after last-day upgrade + expiry");

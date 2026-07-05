@@ -85,6 +85,7 @@ contract RamMiningVaultForkTest is Test {
             vm.envOr("NVDA_USD_FEED", NVDA_USD),
             vm.envOr("BNB_USD_FEED", BNB_USD),
             uint256(0.001 ether),
+            uint256(10e8), // $10 Micro USD-target (8 dec) → Hyper $1,000; sinks read the LIVE BNB/USD feed on the fork
             block.timestamp + 120 days,
             address(ramOracle),
             uint256(1e12),
@@ -134,7 +135,9 @@ contract RamMiningVaultForkTest is Test {
         (uint256 microPrice,,,) = vault.getPlan(0);
         vm.prank(MINER);
         vault.buyMiningContract{value: microPrice}(0); // entry rig (Micro, 1d — expires before the stale warp)
-        forkRam.mint(MINER, 1e24);
+        // v3.2 USD-sink: the Hyper now targets $1,000 in RAM at the LIVE BNB/USD price — mint with ample
+        // headroom so the buy succeeds across any live price / cage-floor path (worst case ≈ 3.6e24 units).
+        forkRam.mint(MINER, 1e25);
         vm.prank(MINER);
         forkRam.approve(address(vault), type(uint256).max);
         vm.prank(MINER);

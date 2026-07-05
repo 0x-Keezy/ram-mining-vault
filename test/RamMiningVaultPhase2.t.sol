@@ -12,7 +12,9 @@ import {
     NothingToRepair,
     TooManyRigs,
     EntryRigMustBeMicro,
-    InsufficientPayment
+    InsufficientPayment,
+    StaleFeed,
+    BadConfig
 } from "../src/RamMiningVault.sol";
 
 contract P2MockToken is ERC20 {
@@ -25,6 +27,7 @@ contract P2MockToken is ERC20 {
 
 contract P2MockFeed {
     int256 internal _answer;
+    uint256 internal _updatedAt; // 0 = always fresh (mirrors block.timestamp); nonzero = pinned (stale tests)
 
     constructor(int256 a) {
         _answer = a;
@@ -38,8 +41,14 @@ contract P2MockFeed {
         _answer = a;
     }
 
+    /// @dev Pin `updatedAt` so a later vm.warp makes the feed STALE (v3.2 USD-sink fail-closed tests).
+    function setUpdatedAt(uint256 t) external {
+        _updatedAt = t;
+    }
+
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
-        return (1, _answer, block.timestamp, block.timestamp, 1);
+        uint256 upd = _updatedAt == 0 ? block.timestamp : _updatedAt;
+        return (1, _answer, upd, upd, 1);
     }
 }
 
@@ -96,6 +105,10 @@ contract RamMiningVaultPhase2Test is Test {
     RamMiningVaultUpgradeable vault;
 
     uint256 basePrice = 0.001 ether;
+    // $0.60 (8 dec) — calibrated to basePrice × the mock BNB/USD ($600) so the BNB and USD tables agree at t0
+    // (exactly what the launcher does on launch day). Keeps every legacy RAM-unit expectation numerically intact:
+    // usd·1e36/(bnbUsd·price) == bnbCost·1e18/price when usd = bnbCost·bnbUsd/1e18.
+    uint256 basePriceUsd = 6e7;
     uint256 seasonEnd;
 
     function setUp() public {
@@ -112,7 +125,7 @@ contract RamMiningVaultPhase2Test is Test {
         // launcher-armed Phase-2: oracle + cage travel in vaultData (no Guardian round-trip needed)
         oracle.set(RAM_BNB_PRICE, true);
         bytes memory vd = abi.encode(
-            address(reward), address(nvdaFeed), address(bnbFeed), basePrice, seasonEnd,
+            address(reward), address(nvdaFeed), address(bnbFeed), basePrice, basePriceUsd, seasonEnd,
             address(oracle), CAGE_MIN, CAGE_MAX, TREASURY
         );
         vm.prank(PORTAL);
@@ -239,13 +252,13 @@ contract RamMiningVaultPhase2Test is Test {
         assertEq(vault.ENTRY_PLAN_ID(), 0);
         _buyBnb(alice, 0); // entry: Micro in BNB — the ONLY legal first buy
         (uint256 hyperPrice,, uint256 hyperDuration,) = vault.getPlan(3);
-        uint256 units = _ramUnitsFor(hyperPrice); // growth: Hyper paid fully in RAM (20x base)
+        uint256 units = _ramUnitsFor(hyperPrice); // growth: Hyper paid fully in RAM (100x base, USD-target)
         uint256 before = ram.balanceOf(alice);
         _buyRam(alice, 3);
         assertEq(ram.balanceOf(alice), before - units);
         (uint256 count, uint256 power,,,) = vault.getUserMinerStats(alice);
         assertEq(count, 2); // Micro (entry) + Hyper (growth)
-        assertEq(power, 10 + 420); // AUDITED table powers, untouched
+        assertEq(power, 100 + 1065); // v3.2 rebalanced table powers (flat yield-per-$, +12% commitment premium)
         // the Hyper carries its full audited duration
         (,,,, uint256 endTime,,, bool active) = vault.getMiningContract(alice, 1);
         assertTrue(active);
@@ -263,7 +276,7 @@ contract RamMiningVaultPhase2Test is Test {
         (, uint256 planId, uint256 power,,,,, bool active) = vault.getMiningContract(alice, 0);
         assertTrue(active);
         assertEq(planId, 1);
-        assertEq(power, 40);
+        assertEq(power, 400);
     }
 
     function testEntryFlagPersistsAcrossExpiry() public {
@@ -284,59 +297,59 @@ contract RamMiningVaultPhase2Test is Test {
         // TIMESTAMP as constant within a call and propagates `block.timestamp` to its use sites — even through
         // a local variable — so any warp target derived from block.timestamp after a prior warp is wrong
         // (cheatcode-only artifact; in production the timestamp IS constant within a tx).
-        _buyBnb(alice, 3); // Hyper: 420 power (AUDITED table), 90d, bought at t = 100 days
+        _buyBnb(alice, 3); // Hyper: 1065 power (v3.2 table), 90d, bought at t = 100 days
         (, uint256 p0,,) = vault.getPlan(3);
-        assertEq(p0, 420);
+        assertEq(p0, 1065);
         (, uint256 cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 420);
+        assertEq(cur, 1065);
 
-        vm.warp(103 days); // 1 step: 420×0.95 = 399
+        vm.warp(103 days); // 1 step: 1065×0.95 = 1011.75 → 1011
         (, cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 399);
+        assertEq(cur, 1011);
 
-        vm.warp(106 days); // 2 steps: 399×0.95 = 379.05 → 379
+        vm.warp(106 days); // 2 steps: 1011×0.95 = 960.45 → 960
         (, cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 379);
+        assertEq(cur, 960);
 
-        vm.warp(159 days); // deep into the 90d life (still alive): floor = 420×0.47 = 197.4 → 197
+        vm.warp(159 days); // deep into the 90d life (still alive): floor = 1065×0.47 = 500.55 → 500
         (uint256 lvl, uint256 cur2, uint256 floorP,,,) = _wear(alice, 0);
-        assertEq(lvl, 420); // schedule start level unchanged (no repair)
-        assertEq(floorP, 197);
-        assertEq(cur2, 197); // decayed to the floor, NEVER zero while alive
+        assertEq(lvl, 1065); // schedule start level unchanged (no repair)
+        assertEq(floorP, 500);
+        assertEq(cur2, 500); // decayed to the floor, NEVER zero while alive
     }
 
     /// @dev Aggregate machinery consistency: after settle, global active power equals the rig's live level.
     function testWearAggregateMatchesPerRig() public {
-        _buyBnb(alice, 3); // Hyper 420
-        vm.warp(block.timestamp + 7 days); // two steps settled (399 → 379)
+        _buyBnb(alice, 3); // Hyper 1065
+        vm.warp(block.timestamp + 7 days); // two steps settled (1011 → 960)
         vault.donateReward(1); // forces _settleExpiries
         (, uint256 cur,,,,) = _wear(alice, 0);
         (,, uint256 globalPower,,,,) = vault.getVaultMiningStats();
         assertEq(globalPower, cur);
-        assertEq(cur, 379);
+        assertEq(cur, 960);
     }
 
     function testWearAdjustsRewardSplit() public {
-        _buyBnb(alice, 2); // Mega 130, 30d
-        vm.warp(block.timestamp + 3 days + 1 hours); // alice stepped: 130×0.95 = 123.5 → 123
-        _buyBnb(bob, 1); // Core 40, fresh (its first step is 3d away)
-        vault.donateReward(163 ether); // settles: total power = 123 + 40 = 163
-        assertApproxEqAbs(vault.pendingRewards(alice), 123 ether, 1e6);
-        assertApproxEqAbs(vault.pendingRewards(bob), 40 ether, 1e6);
+        _buyBnb(alice, 2); // Mega 560, 30d
+        vm.warp(block.timestamp + 3 days + 1 hours); // alice stepped: 560×0.95 = 532
+        _buyBnb(bob, 1); // Core 400, fresh (its first step is 3d away)
+        vault.donateReward(932 ether); // settles: total power = 532 + 400 = 932
+        assertApproxEqAbs(vault.pendingRewards(alice), 532 ether, 1e6);
+        assertApproxEqAbs(vault.pendingRewards(bob), 400 ether, 1e6);
     }
 
     // ── repair ──────────────────────────────────────────────────────────
 
     function testRepairRestoresPowerRespectsAgeCapAndLife() public {
-        _buyBnb(alice, 3); // Hyper 420, 90d
+        _buyBnb(alice, 3); // Hyper 1065, 90d
         (,,,, uint256 lifeEnds0,) = _wear(alice, 0);
 
-        vm.warp(block.timestamp + 12 days); // 4 steps: 420→399→379→360→342
+        vm.warp(block.timestamp + 12 days); // 4 steps: 1065→1011→960→912→866
         (, uint256 cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 342);
-        vault.donateReward(342 ether); // some pending at the worn level
+        assertEq(cur, 866);
+        vault.donateReward(866 ether); // some pending at the worn level
         uint256 pendingBefore = vault.pendingRewards(alice);
-        assertApproxEqAbs(pendingBefore, 342 ether, 1e6);
+        assertApproxEqAbs(pendingBefore, 866 ether, 1e6);
 
         // repair cost: planPrice × 40% → RAM units
         (uint256 planPrice,,,) = vault.getPlan(3);
@@ -350,16 +363,16 @@ contract RamMiningVaultPhase2Test is Test {
         vault.repairRig(0);
         assertEq(ram.balanceOf(alice), ramBefore - expectedUnits);
 
-        // age 12d of the Hyper's 90d → penalty 3000×12/90 = 400 bps → cap 96% → restored = 420×0.96 = 403.2 → 403
+        // age 12d of the Hyper's 90d → penalty 3000×12/90 = 400 bps → cap 96% → restored = 1065×0.96 = 1022.4 → 1022
         (uint256 lvl, uint256 cur2,,, uint256 lifeEnds1, uint256 accrued) = _wear(alice, 0);
-        assertEq(lvl, 403);
-        assertEq(cur2, 403);
+        assertEq(lvl, 1022);
+        assertEq(cur2, 1022);
         assertEq(lifeEnds1, lifeEnds0); // RIG_LIFE wall NEVER extended
         assertApproxEqAbs(accrued, pendingBefore, 1e6); // pending checkpointed, not lost
 
         // aggregate consistent after reschedule
         (,, uint256 globalPower,,,,) = vault.getVaultMiningStats();
-        assertEq(globalPower, 403);
+        assertEq(globalPower, 1022);
 
         // the checkpointed pending is claimable
         vm.prank(alice);
@@ -385,14 +398,14 @@ contract RamMiningVaultPhase2Test is Test {
     // ── upgrade ─────────────────────────────────────────────────────────
 
     function testUpgradeTierPaysDifferenceAndRestartsWear() public {
-        _buyBnb(alice, 1); // Core 40, 7d
-        vm.warp(block.timestamp + 6 days); // 2 steps: 40→38→36 (still alive: dies at 7d)
+        _buyBnb(alice, 1); // Core 400, 7d
+        vm.warp(block.timestamp + 6 days); // 2 steps: 400→380→361 (still alive: dies at 7d)
         (, uint256 cur,,,,) = _wear(alice, 0);
-        assertEq(cur, 36);
+        assertEq(cur, 361);
         (,,,, uint256 lifeEnds0,) = _wear(alice, 0);
 
         (uint256 oldPrice,,,) = vault.getPlan(1);
-        (uint256 newPrice, uint256 newPower,,) = vault.getPlan(2); // Mega 130
+        (uint256 newPrice, uint256 newPower,,) = vault.getPlan(2); // Mega 560
         uint256 expectedUnits = _ramUnitsFor(newPrice - oldPrice);
         (uint256 quoted, bool trusted) = vault.quoteUpgradeInRam(alice, 0, 2);
         assertTrue(trusted);
@@ -423,6 +436,117 @@ contract RamMiningVaultPhase2Test is Test {
         vm.expectRevert(InvalidUpgrade.selector);
         vault.upgradeRig(0, 0); // downgrade
         vm.stopPrank();
+    }
+
+    // ── v3.2 USD-target sink (fixed USD stickers, BNB/USD feed in the growth path) ─
+
+    uint256 constant BNB_USD_P2 = 600e8; // the fixture's mock BNB/USD answer (8 dec)
+
+    /// @dev The USD → RAM units conversion the vault performs: usd·1e36 / (bnbUsd·ramPrice).
+    function _usdUnits(uint256 usd) internal pure returns (uint256) {
+        return (usd * 1e36) / (BNB_USD_P2 * RAM_BNB_PRICE);
+    }
+
+    function testGetPlanUsdTable() public view {
+        assertEq(vault.basePriceUsd(), basePriceUsd);
+        assertEq(vault.getPlanUsd(0), basePriceUsd); // ×1
+        assertEq(vault.getPlanUsd(1), basePriceUsd * 5); // ×5
+        assertEq(vault.getPlanUsd(2), basePriceUsd * 25); // ×25
+        assertEq(vault.getPlanUsd(3), basePriceUsd * 100); // ×100
+    }
+
+    function testQuoteAndChargeMatchUsdTarget() public {
+        // quote = the plan's fixed USD target converted at the live BNB/USD + caged RAM price
+        (uint256 quoted, bool trusted) = vault.quoteRigInRam(1);
+        assertTrue(trusted);
+        assertEq(quoted, _usdUnits(basePriceUsd * 5));
+
+        // and the actual charge matches the quote exactly
+        _buyBnb(alice, 0);
+        uint256 before = ram.balanceOf(alice);
+        _buyRam(alice, 1);
+        assertEq(before - ram.balanceOf(alice), quoted);
+    }
+
+    function testUsdStickerConstantWhenBnbMoves() public {
+        _buyBnb(alice, 0);
+        (uint256 unitsAt600,) = vault.quoteRigInRam(1);
+
+        // BNB halves in USD → the SAME $-sticker costs twice the BNB → twice the RAM units
+        bnbFeed.refreshTo(300e8);
+        (uint256 unitsAt300,) = vault.quoteRigInRam(1);
+        assertEq(unitsAt300, unitsAt600 * 2);
+        assertEq(vault.getPlanUsd(1), basePriceUsd * 5); // the USD sticker itself never moves
+
+        // charge follows the live conversion
+        uint256 before = ram.balanceOf(alice);
+        _buyRam(alice, 1);
+        assertEq(before - ram.balanceOf(alice), unitsAt300);
+    }
+
+    function testStaleBnbFeedBlocksGrowthNotEntryNorClaim() public {
+        // alice is a live miner with a growth Core (bought while the feed is fresh)
+        _buyBnb(alice, 0);
+        _buyRam(alice, 1);
+        vault.donateReward(10 ether);
+
+        // pin the BNB/USD feed and outrun bnbFeedMaxStale (default 2h) → the feed is now STALE
+        bnbFeed.setUpdatedAt(block.timestamp);
+        vm.warp(block.timestamp + 3 hours);
+
+        // growth purchases fail CLOSED (never a mis-priced sink)…
+        vm.prank(alice);
+        vm.expectRevert(StaleFeed.selector);
+        vault.buyMiningContract(0);
+        vm.prank(alice);
+        vm.expectRevert(StaleFeed.selector);
+        vault.upgradeRig(1, 2); // Core → Mega hits the USD charge
+        vm.expectRevert(StaleFeed.selector);
+        vault.quoteRigInRam(1); // quotes are honest: they revert exactly like the buy would
+
+        // …but the BNB entry gate and claims never touch the BNB/USD feed
+        vm.deal(bob, 1 ether);
+        (uint256 microPrice,,,) = vault.getPlan(0);
+        vm.prank(bob);
+        vault.buyMiningContract{value: microPrice}(0); // fresh wallet still enters
+        vm.prank(alice);
+        assertGt(vault.claimRewards(), 0); // claim always available
+
+        // feed recovers → growth resumes
+        bnbFeed.setUpdatedAt(0);
+        _buyRam(alice, 0);
+    }
+
+    function testRepairAndUpgradeChargeUsdTargets() public {
+        _buyBnb(alice, 3); // Hyper
+        vm.warp(block.timestamp + 6 days); // worn (2 steps) → repairable, still young (age cap 98%)
+
+        // repair: repairCostBps (40%) of the plan's USD target
+        (uint256 repairQuote, bool t1) = vault.quoteRepairInRam(alice, 0);
+        assertTrue(t1);
+        assertEq(repairQuote, _usdUnits((basePriceUsd * 100 * 4000) / 10000));
+
+        // upgrade: the USD-target DIFFERENCE between the plans
+        _enter(bob);
+        vm.deal(bob, 1 ether);
+        _buyRam(bob, 1); // bob holds a Core growth rig
+        (uint256 upQuote, bool t2) = vault.quoteUpgradeInRam(bob, 0, 2);
+        assertTrue(t2);
+        assertEq(upQuote, _usdUnits(basePriceUsd * 25 - basePriceUsd * 5));
+        uint256 before = ram.balanceOf(bob);
+        vm.prank(bob);
+        vault.upgradeRig(0, 2);
+        assertEq(before - ram.balanceOf(bob), upQuote);
+    }
+
+    function testBasePriceUsdZeroRevertsBadConfig() public {
+        bytes memory vd = abi.encode(
+            address(reward), address(nvdaFeed), address(bnbFeed), basePrice, uint256(0), seasonEnd,
+            address(oracle), CAGE_MIN, CAGE_MAX, TREASURY
+        );
+        vm.prank(PORTAL);
+        vm.expectRevert(BadConfig.selector);
+        factory.newVault(address(ram), address(0), DEV, vd);
     }
 
     // ── caged pricing (judge-mandated fail-safe shape) ──────────────────

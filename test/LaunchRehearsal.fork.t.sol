@@ -19,11 +19,12 @@ interface IERC20F {
 }
 
 /// @title LaunchRehearsal - full launch-day dress rehearsal on a BSC mainnet fork.
-/// @notice Uses the REAL production factory the partner deployed, the REAL friend token (curve phase), the REAL
-///         production RamPriceOracle, and the REAL NVDAB + Chainlink feeds. Runs only with BNB_RPC_URL set.
+/// @notice Deploys the CURRENT v3.2 factory build into the fork (the exact bytecode the partner will redeploy —
+///         the on-chain v3.1 factory 0x0555A8…4299 is superseded by the v3.2 tier-rebalance + USD-sink vaultData
+///         and CANNOT decode the new 10-field layout), then rehearses against the REAL friend token (curve
+///         phase), the REAL production RamPriceOracle, and the REAL NVDAB + Chainlink feeds. BNB_RPC_URL gated.
 contract LaunchRehearsalForkTest is Test {
-    // Real production factory the partner deployed (byte-identical to our v3.1 build).
-    RamMiningBeaconFactory constant FACTORY = RamMiningBeaconFactory(payable(0x0555A89c4b0b64e08193538e1DC633F4090C4299));
+    RamMiningBeaconFactory FACTORY; // fresh v3.2 build, deployed into the fork in _fork()
     address constant VAULT_PORTAL = 0x90497450f2a706f1951b5bdda52B4E5d16f34C06;
     address constant DEV = 0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1;
     address constant TREASURY = 0xFc389871E3ed4435d588dE14312F6Cd9F24c6dFe;
@@ -40,7 +41,8 @@ contract LaunchRehearsalForkTest is Test {
 
     uint256 constant FLOOR = 10 ether;
     uint16 constant TRUNC = 5000;
-    uint256 constant BASE = 0.001 ether; // Micro price
+    uint256 constant BASE = 0.001 ether; // Micro price (BNB entry)
+    uint256 constant BASE_USD = 10e8; // $10 Micro USD-target (8 dec) → growth tiers $50/$250/$1,000 in RAM
 
     RamPriceOracle oracle;
     RamMiningVaultUpgradeable vault;
@@ -58,6 +60,9 @@ contract LaunchRehearsalForkTest is Test {
         }
         vm.createSelectFork(rpc);
         assertEq(block.chainid, 56, "must fork BNB mainnet");
+        // Deploy the v3.2 factory build into the fork — the exact bytecode the partner will redeploy for
+        // launch (the on-chain v3.1 factory can't decode the new 10-field vaultData).
+        FACTORY = new RamMiningBeaconFactory();
         return true;
     }
 
@@ -89,7 +94,16 @@ contract LaunchRehearsalForkTest is Test {
 
         // ── STEP 3: create the vault via the REAL factory (impersonate the VaultPortal) ──────
         bytes memory vd = abi.encode(
-            NVDAB, NVDA_FEED, BNB_FEED, BASE, block.timestamp + 90 days, address(oracle), cageMin, cageMax, TREASURY
+            NVDAB,
+            NVDA_FEED,
+            BNB_FEED,
+            BASE,
+            BASE_USD,
+            block.timestamp + 90 days,
+            address(oracle),
+            cageMin,
+            cageMax,
+            TREASURY
         );
         vm.prank(VAULT_PORTAL);
         vault = RamMiningVaultUpgradeable(payable(FACTORY.newVault(TEST, address(0), DEV, vd)));
