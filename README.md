@@ -22,8 +22,9 @@ vault, used to acquire **tokenized NVIDIA (NVDAB)**, and distributed to "miners"
   yield-per-BNB basis** — this is intentional, not a fairness guarantee across tiers. Every tier's
   terms (power, duration, price) are public up-front via `getPlan`. A rig's mining end is capped at
   `seasonEnd`, so a long tier bought mid-season earns only until the season ends. Post-RAM-launch
-  (Phase 2), subsequent rigs/upgrades are paid in RAM (USD-priced), which rebalances scaling
-  incentives and introduces RAM's utility sink.
+  (Phase 2), subsequent rigs/upgrades are paid in RAM (BNB-denominated — the RAM cost is the tier's
+  BNB value converted to RAM units at the oracle's live BNB-per-RAM price), which rebalances scaling
+  incentives and introduces RAM's utility sink. A USD-denominated sink is a planned Phase-2 upgrade.
 - **Acquisition — keeper / RFQ (the standard Flap interface).** Tax fees arrive as BNB and accumulate in
   the vault. Instead of swapping on a DEX, the vault acquires NVDAB through a **permissionless keeper
   RFQ**: a keeper sells NVDAB **into** the vault and is paid BNB at the **Chainlink oracle price + a
