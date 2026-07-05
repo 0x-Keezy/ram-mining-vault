@@ -259,8 +259,8 @@ contract RamMiningVaultUpgradeable is
     /// @dev Storage gap for safe future upgrades (append-only): when adding new state vars, append them and
     ///      shrink this gap so the beacon-proxy storage layout never collides. v2 is a fresh deployment
     ///      (new beacon implementation), so this reflects the new layout, not an upgrade-in-place of v1.
-    ///      v3 appended 8 slots (Phase-2 economy) → gap shrunk 44 → 36. v3.2 appended `basePriceUsd` (USD-target
-    ///      sink) → gap shrunk 35 → 34. NOTE: the Rig struct gained fields, which
+    ///      the v3 line appended the Phase-2 state (economy + treasury wallet) → gap shrunk 44 → 35. v3.2
+    ///      appended `basePriceUsd` (USD-target sink) → gap shrunk 35 → 34. NOTE: the Rig struct gained fields, which
     ///      is safe ONLY because v3 deploys as a FRESH beacon implementation for NEW vaults (never an in-place
     ///      upgrade of a live v2 vault's storage).
     uint256[34] private __gap;
