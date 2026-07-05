@@ -6,11 +6,16 @@ A **real-yield mining vault** for the [Flap](https://flap.sh) Tax Vault V2 frame
 
 RAM is a Flap tax token. Instead of buyback-and-burn, a share of its trading fees is routed to this
 vault, used to acquire **tokenized NVIDIA (NVDAB)**, and distributed to "miners" in proportion to their
-**mining power**. You buy mining power ("rigs") with BNB and earn real tokenized NVIDIA.
+**mining power**. You buy mining power ("rigs") and earn real tokenized NVIDIA. **Entry gate:** a
+fresh wallet's **first rig must be the Micro tier, paid in BNB** (`EntryRigMustBeMicro`); every
+subsequent rig, upgrade and repair is paid in **RAM** (the Phase-2 utility sink).
 
 - **Real yield** — rewards come from actual trading fees + a real asset, not from token emissions, so
   there is no "dry vault" risk.
-- **No burn** — fees buy a productive asset and pay it out, rather than being destroyed.
+- **No reward burn** — BNB trading fees are never destroyed: they buy a productive asset (NVDAB) and
+  pay it out. (Scope: this refers to the fee→reward flow. The Phase-2 **RAM utility sink**, by
+  contrast, deliberately burns **85%** of RAM spent on rig #2+/upgrades/repairs, with 15% to the
+  treasury wallet — see `_chargeRam`.)
 
 ## Mechanism (reference for review)
 
@@ -20,7 +25,9 @@ vault, used to acquire **tokenized NVIDIA (NVDAB)**, and distributed to "miners"
   duration commitment**: longer / larger tiers earn proportionally more reward per BNB than the entry
   tier (their `power × active-duration` per BNB is higher), so the tiers are **not equal on a
   yield-per-BNB basis** — this is intentional, not a fairness guarantee across tiers. Every tier's
-  terms (power, duration, price) are public up-front via `getPlan`. A rig's mining end is capped at
+  terms (power, duration, price) are public up-front via `getPlan`. A fresh wallet's **first**
+  purchase is hard-restricted to the **Micro** tier in BNB (`ENTRY_PLAN_ID` / `EntryRigMustBeMicro`);
+  higher tiers are bought as rig #2+ and paid in RAM. A rig's mining end is capped at
   `seasonEnd`, so a long tier bought mid-season earns only until the season ends. Post-RAM-launch
   (Phase 2), subsequent rigs/upgrades are paid in RAM (BNB-denominated — the RAM cost is the tier's
   BNB value converted to RAM units at the oracle's live BNB-per-RAM price), which rebalances scaling
