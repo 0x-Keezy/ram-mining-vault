@@ -258,7 +258,7 @@ contract RamMiningVaultPhase2Test is Test {
         assertEq(ram.balanceOf(alice), before - units);
         (uint256 count, uint256 power,,,) = vault.getUserMinerStats(alice);
         assertEq(count, 2); // Micro (entry) + Hyper (growth)
-        assertEq(power, 100 + 1065); // v3.2 rebalanced table powers (flat yield-per-$, +12% commitment premium)
+        assertEq(power, 100 + 1065); // v3.2 rebalanced table powers (flat yield-per-$, ~+5% commitment premium)
         // the Hyper carries its full audited duration
         (,,,, uint256 endTime,,, bool active) = vault.getMiningContract(alice, 1);
         assertTrue(active);

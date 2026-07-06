@@ -3,7 +3,7 @@
 This package is the source for the **v3 re-audit** requested by the Flap team ("if it is not covered in the previous audit, we need to perform another audit" — 2026-07-03). It is self-contained: sources, tests, pinned dependencies and build config.
 
 - **Audited base (previous audit):** branch `v2-keeper` @ `87847a4de8c7ed2e32a15624d69ced0797adc57c`
-- **Audit target (this package):** branch `v3-economy` — **v3.2** (public repo: https://github.com/0x-Keezy/ram-mining-vault/tree/v3-economy). `src/` and `test/` are byte-identical to code commit `574e206`; the only `src/` delta versus the v3.2 code commit `7bde569` is a 4-line storage-gap NatSpec touch-up (runtime bytecode **identical** — verify with `forge build`). The branch head advances only with documentation commits (this AUDIT.md / README / foundry.toml comments) on top of that frozen code.
+- **Audit target (this package):** branch `v3-economy` — **v3.2** (public repo: https://github.com/0x-Keezy/ram-mining-vault/tree/v3-economy). `src/` and `test/` are **functionally frozen** at v3.2 code commit `7bde569`: the runtime bytecode keccak is unchanged and all 136 tests pass identically. The only deltas since `7bde569` are NatSpec/comment touch-ups (storage-gap prose; the corrected tier power-days-per-$ figures) plus this documentation (AUDIT.md / README / foundry.toml comments) — none affect bytecode (comments don't compile). Verify with `forge build` + the `deployedBytecode` hash.
 - **Contact:** Shilder (dev-lock wallet `0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1`), Telegram group `Shilder <> FLAP`
 
 ## 0-bis. v3.2 changelog — deliberate tier rebalance + USD-denominated RAM sink (disclosed up-front)
@@ -58,7 +58,7 @@ One change landed after our re-review letter: **`EntryRigMustBeMicro` — a fres
 
 ## 1. Scope of the diff to audit (v2-keeper → v3-economy)
 
-`git diff 87847a4..574e206 -- src/` (src/ is byte-identical at this package's head):
+`git diff 87847a4..574e206 -- src/` (the v3.2 code diff; the package head adds only bytecode-neutral NatSpec/comment touch-ups on top):
 
 | File | Change | What it is |
 |---|---|---|

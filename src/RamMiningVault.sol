@@ -1450,7 +1450,7 @@ contract RamMiningVaultUpgradeable is
     // ──────────────────────────────────────────────────────────────────────────
 
     /// @dev v3.2 tier table — REBALANCED to approximately flat yield-per-$ with a mild commitment premium
-    ///      (wear-adjusted power-days per $: Core 50.4 / Mega 53.2 / Hyper 56.6 → up to ~+12% for the 90-day
+    ///      (wear-adjusted power-days per $: Core ≈54 / Mega ≈54 / Hyper ≈57 → up to ~+5% for the 90-day
     ///      tier), deliberately resolving the yield-per-BNB skew flagged in the original audit (F2): under the
     ///      old ×1/×3/×8/×20 table the top tier bought power-days ~13× cheaper per $ (wear-adjusted) than the
     ///      Core, which the economic review found unsustainable for a shared pro-rata pool. Durations are

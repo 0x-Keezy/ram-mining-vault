@@ -23,7 +23,7 @@ subsequent rig, upgrade and repair is paid in **RAM at fixed USD targets** (the 
   asynchronously-funded reward pool **pro-rata by each miner's power**. No inflation, no emission.
 - **Tier economics (disclosure).** The four rig tiers (Micro/Core/Mega/Hyper) are priced to an
   approximately **flat yield-per-$** with a mild **commitment premium**: wear-adjusted
-  `power × active-duration` per dollar is ~equal across the paid tiers, rising up to ~**+12%** for the
+  `power × active-duration` per dollar is ~equal across the paid tiers, rising up to ~**+5%** for the
   90-day Hyper (rewarding duration commitment — v3.2 deliberately rebalanced the table, resolving the
   yield-per-BNB skew flagged in the original audit). The Micro is the **entry gate**, not a yield
   vehicle. Every tier's terms are public up-front via `getPlan` (BNB reference) and `getPlanUsd`
