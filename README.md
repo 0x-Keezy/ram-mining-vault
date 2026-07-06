@@ -15,7 +15,7 @@ subsequent rig, upgrade and repair is paid in **RAM at fixed USD targets** (the 
 - **No reward burn** — BNB trading fees are never destroyed: they buy a productive asset (NVDAB) and
   pay it out. (Scope: this refers to the fee→reward flow. The Phase-2 **RAM utility sink**, by
   contrast, deliberately burns **85%** of RAM spent on rig #2+/upgrades/repairs, with 15% to the
-  treasury wallet — see `_chargeRam`.)
+  treasury wallet — see `_chargeRamUsd`.)
 
 ## Mechanism (reference for review)
 
@@ -35,7 +35,9 @@ subsequent rig, upgrade and repair is paid in **RAM at fixed USD targets** (the 
   (`basePriceUsd × 1/5/25/100`, 8-dec; converted USD → BNB via the hardened Chainlink BNB/USD feed,
   then BNB → RAM units at the oracle's live price — a stale feed makes the growth purchase revert,
   never mis-price), which rebalances scaling incentives and introduces RAM's utility sink. The entry
-  Micro stays BNB-priced (`basePriceWei`; no feed dependency in the entry path).
+  Micro stays BNB-priced (`basePriceWei`; no feed dependency in the entry path). Its BNB sticker
+  therefore drifts with BNB/USD after the launch-day calibration — disclosed; the USD-priced growth
+  tiers do not drift.
 - **Acquisition — keeper / RFQ (the standard Flap interface).** Tax fees arrive as BNB and accumulate in
   the vault. Instead of swapping on a DEX, the vault acquires NVDAB through a **permissionless keeper
   RFQ**: a keeper sells NVDAB **into** the vault and is paid BNB at the **Chainlink oracle price + a
@@ -103,7 +105,8 @@ endorsed, so the vault is filled by Flap's keepers (and optionally our own) rath
 | File | Role |
 |------|------|
 | `src/RamMiningVault.sol` | Vault (`RamMiningVaultUpgradeable`) + factory (`RamMiningBeaconFactory`) |
-| `src/TestNvdaToken.sol`  | Testnet mock for tokenized NVIDIA (no NVDA on testnet) |
+| `src/RamPriceOracle.sol` | Production RAM/BNB price oracle for the Phase-2 sinks (curve/TWAP + freshness/liquidity/maturity gates; wired via `vaultData`) |
+| `src/TestNvdaToken.sol`, `src/TestPriceFeed.sol`, `src/TestRamOracle.sol` | Testnet mocks (tokenized NVIDIA / Chainlink feed / fixed-price RAM oracle) — never deployed to production |
 | `src/FlapDeployed.sol`   | Chain address resolver (VaultPortal mainnet/testnet) |
 | `src/flap/`              | Flap V2 framework interfaces/bases — **REQUIRED & IMMUTABLE**, do not modify |
 
@@ -113,7 +116,7 @@ endorsed, so the vault is filled by Flap's keepers (and optionally our own) rath
 forge build
 forge test
 # mainnet-fork integration test against the REAL NVDAB (needs a BNB mainnet RPC):
-BNB_RPC_URL=https://bsc-rpc.publicnode.com \
+BNB_RPC_URL=https://bsc-dataseed.bnbchain.org \
 NVDAX_ADDRESS=0x02Fca66C1D1aFB4E2A7884261eB00F63598a7436 \
 forge test --match-path test/RamMiningVault.fork.t.sol -vv
 ```
@@ -122,12 +125,11 @@ The fork test runs the full keeper path against the real asset: a keeper fills N
 BNB, the vault distributes it by power, a miner claims real NVDAB, and the dead-feed staleness wall reverts
 once the feed is stale beyond the bound.
 
-## Deploy (BNB testnet)
+## Deploy
 
-```bash
-forge script script/testnet/bnb/DeployRamMining.s.sol:DeployRamMining \
-  --rpc-url $BNB_TESTNET_RPC --broadcast
-```
+Deployment scripts live in the full public repo (`script/`), not in this source-only audit ZIP.
+Production launches go through the Flap VaultPortal with the 10-field `vaultData` (see AUDIT.md §0-bis
+for the field list, including the v3.2 `basePriceUsd`).
 
 ## License
 

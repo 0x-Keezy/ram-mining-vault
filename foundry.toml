@@ -7,9 +7,12 @@ solc_version = "0.8.26"
 optimizer = true
 # Size-optimized build: the vault runtime must stay under EIP-170 (24,576 B) and the factory
 # initcode (which embeds the vault creation code) under EIP-3860 (49,152 B) — BSC enforces both.
-# runs=1 + via_ir + no CBOR trailer bring the vault to ~23.9 KB (legacy 99999-runs build was 40 KB, undeployable).
+# runs=1 + via_ir + no CBOR trailer keep the vault runtime at 19,425 B in v3.2 (legacy 99999-runs build was 40 KB, undeployable).
 optimizer_runs = 1
 via_ir = true
 bytecode_hash = "none"
+
+[fuzz]
+runs = 2048
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
