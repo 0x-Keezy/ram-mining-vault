@@ -58,7 +58,7 @@ One change landed after our re-review letter: **`EntryRigMustBeMicro` — a fres
 
 ## 1. Scope of the diff to audit (v2-keeper → v3-economy)
 
-`git diff 87847a4..574e206 -- src/` (the v3.2 code diff; the package head adds only bytecode-neutral NatSpec/comment touch-ups on top):
+`git diff 87847a4..574e206 -- src/` (`574e206` = the `7bde569` v3.2 code commit + a bytecode-neutral storage-gap comment; the package head adds only more such NatSpec/comment touch-ups on top):
 
 | File | Change | What it is |
 |---|---|---|
