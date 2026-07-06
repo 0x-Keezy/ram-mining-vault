@@ -3,7 +3,7 @@
 This package is the source for the **v3 re-audit** requested by the Flap team ("if it is not covered in the previous audit, we need to perform another audit" — 2026-07-03). It is self-contained: sources, tests, pinned dependencies and build config.
 
 - **Audited base (previous audit):** branch `v2-keeper` @ `87847a4de8c7ed2e32a15624d69ced0797adc57c`
-- **Audit target (this package):** branch `v3-economy`, head `574e206` — **v3.2** (public repo: https://github.com/0x-Keezy/ram-mining-vault/tree/v3-economy). `src/` and `test/` are byte-identical to `574e206`; the only `src/` delta versus the v3.2 code commit `7bde569` is a 4-line storage-gap NatSpec touch-up (runtime bytecode **identical** — verify with `forge build`). Everything the branch head adds on top of the code is documentation (this AUDIT.md / README / foundry.toml comments).
+- **Audit target (this package):** branch `v3-economy` — **v3.2** (public repo: https://github.com/0x-Keezy/ram-mining-vault/tree/v3-economy). `src/` and `test/` are byte-identical to code commit `574e206`; the only `src/` delta versus the v3.2 code commit `7bde569` is a 4-line storage-gap NatSpec touch-up (runtime bytecode **identical** — verify with `forge build`). The branch head advances only with documentation commits (this AUDIT.md / README / foundry.toml comments) on top of that frozen code.
 - **Contact:** Shilder (dev-lock wallet `0x8216fCD8a714B82Ee9d60793F551957D9abc1CA1`), Telegram group `Shilder <> FLAP`
 
 ## 0-bis. v3.2 changelog — deliberate tier rebalance + USD-denominated RAM sink (disclosed up-front)
